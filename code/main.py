@@ -16,12 +16,13 @@ st.set_page_config(
     layout="wide",
 )
 
+
 DATA_URL = (
     "https://raw.githubusercontent.com/yejun4484-ux/GOAL-PROJECT/"
     "refs/heads/main/data/"
     "%25EA%25BF%2588%25EB%2591%2590%25EB%25A0%2588_"
     "%25EB%258D%25B0%25EC%259D%25B4%25ED%2584%25B0_"
-    "%25EC%25B6%2595%25EA%25B5%2590.csv"
+    "%25EC%25B6%2595%25EA%25B5%25AC.csv"
 )
 
 
