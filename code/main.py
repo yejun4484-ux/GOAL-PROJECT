@@ -21,7 +21,7 @@ DATA_URL = (
     "refs/heads/main/data/"
     "%25EA%25BF%2588%25EB%2591%2590%25EB%25A0%2588_"
     "%25EB%258D%25B0%25EC%259D%25B4%25ED%2584%25B0_"
-    "%25EC%25B6%2595%25EA%25B5%25AC.csv"
+    "%25EC%25B6%2595%25EA%25B5%2590.csv"
 )
 
 
@@ -89,10 +89,17 @@ def load_data():
                         io.BytesIO(response.content),
                         encoding=encoding,
                     )
-                    df.columns = [str(c).strip() for c in df.columns]
+
+                    df.columns = [
+                        str(c).strip() for c in df.columns
+                    ]
+
                     return df, url, None
 
-                except (UnicodeDecodeError, pd.errors.ParserError):
+                except (
+                    UnicodeDecodeError,
+                    pd.errors.ParserError,
+                ):
                     continue
 
         except Exception as exc:
@@ -114,7 +121,10 @@ def prepare_numeric_columns(df):
         name = str(col).lower()
 
         # 날짜 열은 숫자로 변환하지 않는다.
-        if any(word in name for word in ("날짜", "date", "time", "일시")):
+        if any(
+            word in name
+            for word in ("날짜", "date", "time", "일시")
+        ):
             continue
 
         original = result[col]
@@ -125,7 +135,11 @@ def prepare_numeric_columns(df):
             .str.strip()
         )
 
-        converted = pd.to_numeric(cleaned, errors="coerce")
+        converted = pd.to_numeric(
+            cleaned,
+            errors="coerce",
+        )
+
         non_missing = original.notna().sum()
 
         if (
@@ -143,14 +157,20 @@ def prepare_numeric_columns(df):
 def show_missing_table(df):
     missing = pd.DataFrame({
         "열 이름": df.columns,
+
         "결측치 개수": [
             int(df[col].isna().sum())
             for col in df.columns
         ],
+
         "결측치 비율(%)": [
-            round(float(df[col].isna().mean() * 100), 2)
+            round(
+                float(df[col].isna().mean() * 100),
+                2,
+            )
             for col in df.columns
         ],
+
         "자료형": [
             str(df[col].dtype)
             for col in df.columns
@@ -164,334 +184,485 @@ def show_missing_table(df):
 
 
 # ==========================================
-# 아시아 팀과 비아시아 팀 비교용 데이터
+# 전반전 상황과 최종 결과 분석
 # ==========================================
-def make_team_comparison_data(df):
-    required_columns = [
+def show_asia_comparison(df):
+
+    st.subheader("🌏 전반전 상황과 최종 결과 비교")
+
+    st.write(
+        "아시아 팀과 비아시아 팀을 상대로 경기했을 때, "
+        "전반전의 우세·동점·열세가 최종 결과로 "
+        "어떻게 이어졌는지 분석합니다."
+    )
+
+    # --------------------------------------
+    # 열 이름 자동 탐색
+    # --------------------------------------
+    def find_column(candidates):
+        for col in candidates:
+            if col in df.columns:
+                return col
+        return None
+
+    korea_ht_col = find_column([
+        "한국_전반득점",
+        "한국_전반전득점",
+        "한국_전반",
+        "전반_한국득점",
+        "한국_전반스코어",
+    ])
+
+    opponent_ht_col = find_column([
+        "상대_전반득점",
+        "상대_전반전득점",
+        "상대_전반",
+        "전반_상대득점",
+        "상대_전반스코어",
+    ])
+
+    required = [
         "상대팀",
         "한국_최종득점",
         "상대_최종득점",
-        "최종결과",
     ]
 
-    missing_columns = [
-        col for col in required_columns
+    missing = [
+        col for col in required
         if col not in df.columns
     ]
 
-    if missing_columns:
-        return None, missing_columns
-
-    result = df.copy()
-
-    result["한국_최종득점"] = pd.to_numeric(
-        result["한국_최종득점"],
-        errors="coerce",
-    )
-
-    result["상대_최종득점"] = pd.to_numeric(
-        result["상대_최종득점"],
-        errors="coerce",
-    )
-
-    result["대륙 구분"] = result["상대팀"].apply(classify_team)
-
-    result["골득실"] = (
-        result["한국_최종득점"]
-        - result["상대_최종득점"]
-    )
-
-    result = result.dropna(
-        subset=[
-            "한국_최종득점",
-            "상대_최종득점",
-            "최종결과",
-        ]
-    )
-
-    return result, []
-
-
-# ==========================================
-# 아시아 팀 vs 비아시아 팀 분석 화면
-# ==========================================
-def show_asia_comparison(df):
-    st.subheader("🌏 아시아 팀 vs 비아시아 팀")
-
-    st.write(
-        "한국 남자 축구 국가대표팀이 아시아 팀과 경기했을 때와 "
-        "비아시아 팀과 경기했을 때의 성적을 비교합니다."
-    )
-
-    comparison_df, missing_columns = make_team_comparison_data(df)
-
-    if missing_columns:
+    if missing:
         st.error(
-            "비교 분석에 필요한 열이 없습니다: "
-            + ", ".join(missing_columns)
+            "필요한 열을 찾지 못했습니다: "
+            + ", ".join(missing)
         )
         return
 
-    # 분류되지 않은 팀이 있는지 확인
-    unknown_teams = comparison_df[
-        comparison_df["대륙 구분"] == "분류 확인 필요"
-    ]["상대팀"].dropna().unique().tolist()
-
-    if unknown_teams:
-        st.warning(
-            "다음 팀은 아시아 여부를 확인할 수 없어 비교에서 제외합니다: "
-            + ", ".join(unknown_teams)
+    if korea_ht_col is None or opponent_ht_col is None:
+        st.error(
+            "전반전 득점 열을 찾지 못했습니다. "
+            "현재 CSV의 열 이름을 확인해 주세요."
         )
 
-    comparison_df = comparison_df[
-        comparison_df["대륙 구분"].isin(
-            ["아시아 팀", "비아시아 팀"]
+        st.write("현재 CSV 열 이름:")
+        st.write(df.columns.tolist())
+        return
+
+    # --------------------------------------
+    # 분석용 데이터 만들기
+    # --------------------------------------
+    data = df.copy()
+
+    score_columns = [
+        korea_ht_col,
+        opponent_ht_col,
+        "한국_최종득점",
+        "상대_최종득점",
+    ]
+
+    for col in score_columns:
+        data[col] = pd.to_numeric(
+            data[col],
+            errors="coerce",
         )
+
+    data = data.dropna(
+        subset=score_columns
+    ).copy()
+
+    data["대륙 구분"] = data["상대팀"].apply(
+        classify_team
+    )
+
+    data = data[
+        data["대륙 구분"].isin([
+            "아시아 팀",
+            "비아시아 팀",
+        ])
     ].copy()
 
-    if comparison_df.empty:
-        st.warning("비교할 경기 데이터가 없습니다.")
+    if data.empty:
+        st.warning("분석할 수 있는 경기 데이터가 없습니다.")
         return
 
-    # 연도 필터
-    st.markdown("#### 분석 기간 선택")
+    # --------------------------------------
+    # 전반전 상황 분류
+    # --------------------------------------
+    def get_half_time_state(row):
 
-    if "연도" in comparison_df.columns:
-        comparison_df["연도"] = pd.to_numeric(
-            comparison_df["연도"],
+        korea = row[korea_ht_col]
+        opponent = row[opponent_ht_col]
+
+        if korea > opponent:
+            return "한국 우세"
+
+        elif korea == opponent:
+            return "동점"
+
+        else:
+            return "한국 열세"
+
+    # --------------------------------------
+    # 최종 결과 분류
+    # --------------------------------------
+    def get_final_state(row):
+
+        korea = row["한국_최종득점"]
+        opponent = row["상대_최종득점"]
+
+        if korea > opponent:
+            return "승리"
+
+        elif korea == opponent:
+            return "무승부"
+
+        else:
+            return "패배"
+
+    data["전반전 상황"] = data.apply(
+        get_half_time_state,
+        axis=1,
+    )
+
+    data["최종 결과"] = data.apply(
+        get_final_state,
+        axis=1,
+    )
+
+    # --------------------------------------
+    # 연도 필터
+    # --------------------------------------
+    if "연도" in data.columns:
+
+        data["연도"] = pd.to_numeric(
+            data["연도"],
             errors="coerce",
         )
 
         years = sorted(
-            comparison_df["연도"].dropna().astype(int).unique().tolist()
+            data["연도"]
+            .dropna()
+            .astype(int)
+            .unique()
         )
 
-        if years:
+        if len(years) > 0:
+
             selected_years = st.multiselect(
-                "분석할 연도",
+                "분석할 연도 선택",
                 options=years,
                 default=years,
+                key="asia_ht_years",
             )
 
-            if selected_years:
-                comparison_df = comparison_df[
-                    comparison_df["연도"].isin(selected_years)
-                ]
-            else:
-                st.info("분석할 연도를 하나 이상 선택해 주세요.")
+            if not selected_years:
+                st.info(
+                    "분석할 연도를 하나 이상 선택해 주세요."
+                )
                 return
 
-    if comparison_df.empty:
-        st.warning("선택한 기간에 해당하는 경기가 없습니다.")
-        return
+            data = data[
+                data["연도"].isin(selected_years)
+            ]
 
-    # 두 집단 데이터
-    asia_df = comparison_df[
-        comparison_df["대륙 구분"] == "아시아 팀"
-    ]
-
-    non_asia_df = comparison_df[
-        comparison_df["대륙 구분"] == "비아시아 팀"
-    ]
-
-    if asia_df.empty or non_asia_df.empty:
+    if data.empty:
         st.warning(
-            "두 집단 중 한쪽의 경기 데이터가 없습니다. "
-            "분석 기간을 다시 선택해 주세요."
+            "선택한 기간에 해당하는 경기가 없습니다."
         )
         return
+
+    asia = data[
+        data["대륙 구분"] == "아시아 팀"
+    ]
+
+    non_asia = data[
+        data["대륙 구분"] == "비아시아 팀"
+    ]
+
+    if asia.empty or non_asia.empty:
+        st.warning(
+            "아시아 팀과 비아시아 팀 양쪽의 경기 기록이 필요합니다."
+        )
+        return
+
+    ht_order = [
+        "한국 우세",
+        "동점",
+        "한국 열세",
+    ]
+
+    ft_order = [
+        "승리",
+        "무승부",
+        "패배",
+    ]
 
     st.divider()
 
-    # --------------------------------------
+    # ======================================
     # 1. 경기 수
-    # --------------------------------------
-    st.markdown("### 1. 집단별 경기 수")
+    # ======================================
+    st.markdown("### 1. 분석 대상 경기 수")
 
-    col1, col2 = st.columns(2)
+    c1, c2 = st.columns(2)
 
-    col1.metric(
+    c1.metric(
         "아시아 팀과의 경기",
-        f"{len(asia_df):,}경기",
+        f"{len(asia)}경기",
     )
 
-    col2.metric(
+    c2.metric(
         "비아시아 팀과의 경기",
-        f"{len(non_asia_df):,}경기",
+        f"{len(non_asia)}경기",
     )
 
-    count_df = pd.DataFrame({
-        "경기 수": [
-            len(asia_df),
-            len(non_asia_df),
-        ]
-    }, index=["아시아 팀", "비아시아 팀"])
+    count_df = pd.DataFrame(
+        {
+            "경기 수": [
+                len(asia),
+                len(non_asia),
+            ]
+        },
+        index=[
+            "아시아 팀",
+            "비아시아 팀",
+        ],
+    )
 
     st.bar_chart(count_df)
 
-    st.caption(
-        "집단별 경기 수가 다를 수 있으므로 전체 승리 횟수보다는 "
-        "승리 비율과 경기당 평균 득점을 함께 비교하는 것이 좋습니다."
+    # ======================================
+    # 교차표 계산 함수
+    # ======================================
+    def make_transition_table(group):
+
+        counts = pd.crosstab(
+            group["전반전 상황"],
+            group["최종 결과"],
+        )
+
+        counts = counts.reindex(
+            index=ht_order,
+            columns=ft_order,
+            fill_value=0,
+        )
+
+        rates = counts.div(
+            counts.sum(axis=1).replace(
+                0,
+                float("nan"),
+            ),
+            axis=0,
+        ) * 100
+
+        return counts, rates.fillna(0).round(1)
+
+    asia_counts, asia_rates = make_transition_table(asia)
+
+    non_counts, non_rates = make_transition_table(
+        non_asia
     )
 
+    # ======================================
+    # 2. 아시아 팀
+    # ======================================
     st.divider()
 
-    # --------------------------------------
-    # 2. 승리·무승부·패배
-    # --------------------------------------
-    st.markdown("### 2. 승리·무승부·패배 비교")
+    st.markdown(
+        "### 2. 아시아 팀과 경기했을 때"
+    )
 
-    result_order = ["승리", "무승부", "패배"]
-
-    outcome_counts = pd.DataFrame({
-        "아시아 팀": (
-            asia_df["최종결과"]
-            .value_counts()
-            .reindex(result_order, fill_value=0)
-        ),
-        "비아시아 팀": (
-            non_asia_df["최종결과"]
-            .value_counts()
-            .reindex(result_order, fill_value=0)
-        ),
-    })
-
-    st.markdown("#### 결과별 경기 수")
+    st.markdown(
+        "#### 전반전 상황 → 최종 결과 (경기 수)"
+    )
 
     st.dataframe(
-        outcome_counts,
+        asia_counts,
         use_container_width=True,
     )
 
-    outcome_rates = outcome_counts.copy()
-
-    outcome_rates["아시아 팀"] = (
-        outcome_rates["아시아 팀"] / len(asia_df) * 100
+    st.markdown(
+        "#### 전반전 상황 → 최종 결과 (비율 %)"
     )
-
-    outcome_rates["비아시아 팀"] = (
-        outcome_rates["비아시아 팀"] / len(non_asia_df) * 100
-    )
-
-    outcome_rates = outcome_rates.round(1)
-
-    st.markdown("#### 결과별 비율(%)")
 
     st.dataframe(
-        outcome_rates,
+        asia_rates,
         use_container_width=True,
     )
 
-    st.bar_chart(outcome_rates)
-
     st.caption(
-        "승리율은 해당 집단과의 전체 경기 중 승리한 경기의 비율입니다."
+        "각 행의 비율은 해당 전반전 상황에 속한 경기만을 "
+        "기준으로 계산합니다."
     )
 
+    st.markdown("#### 결과 변화 그래프")
+
+    st.bar_chart(asia_rates)
+
+    # ======================================
+    # 3. 비아시아 팀
+    # ======================================
     st.divider()
 
-    # --------------------------------------
-    # 3. 평균 득점과 실점
-    # --------------------------------------
-    st.markdown("### 3. 경기당 평균 득점과 실점")
-
-    score_summary = comparison_df.groupby("대륙 구분").agg(
-        경기수=("상대팀", "count"),
-        평균득점=("한국_최종득점", "mean"),
-        평균실점=("상대_최종득점", "mean"),
-        평균골득실=("골득실", "mean"),
+    st.markdown(
+        "### 3. 비아시아 팀과 경기했을 때"
     )
 
-    score_summary = score_summary.reindex(
-        ["아시아 팀", "비아시아 팀"]
-    ).round(2)
+    st.markdown(
+        "#### 전반전 상황 → 최종 결과 (경기 수)"
+    )
 
     st.dataframe(
-        score_summary,
+        non_counts,
         use_container_width=True,
     )
 
-    score_chart = score_summary[
-        ["평균득점", "평균실점"]
-    ]
+    st.markdown(
+        "#### 전반전 상황 → 최종 결과 (비율 %)"
+    )
 
-    st.markdown("#### 평균 득점과 실점 그래프")
-
-    st.bar_chart(score_chart)
-
-    st.markdown("#### 평균 골득실 그래프")
-
-    st.bar_chart(
-        score_summary[["평균골득실"]]
+    st.dataframe(
+        non_rates,
+        use_container_width=True,
     )
 
     st.caption(
-        "골득실은 한국의 최종 득점에서 상대팀의 최종 득점을 뺀 값입니다. "
-        "양수이면 평균적으로 득점이 실점보다 많았다는 뜻입니다."
+        "각 행의 비율은 해당 전반전 상황에 속한 경기만을 "
+        "기준으로 계산합니다."
     )
 
+    st.markdown("#### 결과 변화 그래프")
+
+    st.bar_chart(non_rates)
+
+    # ======================================
+    # 4. 핵심 지표 비교
+    # ======================================
     st.divider()
 
-    # --------------------------------------
-    # 4. 경기별 상세 데이터
-    # --------------------------------------
-    st.markdown("### 4. 경기별 결과 확인")
+    st.markdown("### 4. 핵심 결과 비교")
 
-    show_columns = [
+    def calculate_indicators(group):
+
+        leading = group[
+            group["전반전 상황"] == "한국 우세"
+        ]
+
+        trailing = group[
+            group["전반전 상황"] == "한국 열세"
+        ]
+
+        return {
+            "전반전 우세 경기 수": len(leading),
+
+            "우세를 지켜 승리한 비율(%)": (
+                (leading["최종 결과"] == "승리").mean() * 100
+                if len(leading) else 0
+            ),
+
+            "전반전 열세 경기 수": len(trailing),
+
+            "열세에서 역전 승리한 비율(%)": (
+                (trailing["최종 결과"] == "승리").mean() * 100
+                if len(trailing) else 0
+            ),
+
+            "전반전 열세에서 패배를 피한 비율(%)": (
+                (trailing["최종 결과"] != "패배").mean() * 100
+                if len(trailing) else 0
+            ),
+        }
+
+    asia_indicators = calculate_indicators(asia)
+
+    non_indicators = calculate_indicators(non_asia)
+
+    indicator_table = pd.DataFrame({
+        "아시아 팀": asia_indicators,
+        "비아시아 팀": non_indicators,
+    }).round(1)
+
+    st.dataframe(
+        indicator_table,
+        use_container_width=True,
+    )
+
+    st.caption(
+        "우세 유지율은 전반전 우세 경기 중 최종 승리한 비율입니다. "
+        "역전 승리율은 전반전 열세 경기 중 최종 승리한 비율입니다."
+    )
+
+    # ======================================
+    # 5. 경기별 상세 기록
+    # ======================================
+    st.divider()
+
+    st.markdown("### 5. 경기별 전반전과 최종 결과")
+
+    detail_columns = [
         col for col in [
             "날짜",
             "연도",
             "상대팀",
             "대륙 구분",
+            korea_ht_col,
+            opponent_ht_col,
+            "전반전 상황",
             "한국_최종득점",
             "상대_최종득점",
-            "골득실",
-            "최종결과",
+            "최종 결과",
         ]
-        if col in comparison_df.columns
+        if col in data.columns
     ]
 
-    detail_df = comparison_df[show_columns].copy()
+    detail = data[detail_columns].copy()
 
-    st.dataframe(
-        detail_df.sort_values(
+    if "날짜" in detail.columns:
+        detail = detail.sort_values(
             "날짜",
             ascending=False,
-        ) if "날짜" in detail_df.columns else detail_df,
+        )
+
+    st.dataframe(
+        detail,
         use_container_width=True,
         hide_index=True,
     )
 
     st.download_button(
-        "아시아·비아시아 비교 데이터 다운로드",
-        data=comparison_df.to_csv(
+        "전반전-최종결과 분석 데이터 다운로드",
+        data=data.to_csv(
             index=False
         ).encode("utf-8-sig"),
-        file_name="아시아_비아시아_경기비교.csv",
+        file_name="전반전_최종결과_아시아비아시아.csv",
         mime="text/csv",
     )
 
+    # ======================================
+    # 6. 분석 결과 해석 안내
+    # ======================================
     st.divider()
 
-    # --------------------------------------
-    # 5. 분석 결과 해석 안내
-    # --------------------------------------
-    st.markdown("### 5. 분석할 때 주의할 점")
+    st.markdown("### 6. 분석 결과 해석하기")
 
     st.info(
         """
-        - 경기 수가 서로 다르면 전체 승리 횟수만으로 비교하면 안 됩니다.
-        - 승리율과 경기당 평균 득점·실점을 함께 살펴보세요.
-        - 상대팀의 실력, 대회 종류, 경기 장소 등 다른 요인도 결과에 영향을 줄 수 있습니다.
-        - 이 분석만으로 아시아 팀과의 경기에서 성적이 달라지는 원인을 확정할 수는 없습니다.
+        **분석할 때 확인할 내용**
+
+        1. 전반전에 한국이 앞선 경우, 최종 승리로 이어지는 비율은 어느 집단에서 더 높은가?
+        2. 전반전에 동점이었던 경기는 최종적으로 어떤 결과가 많았는가?
+        3. 전반전에 한국이 뒤진 경우, 역전 승리하거나 무승부를 만든 비율은 어느 집단에서 더 높은가?
+        4. 두 집단의 경기 수가 다를 수 있으므로 횟수뿐 아니라 비율도 함께 비교해야 한다.
         """
     )
 
     st.markdown("#### 탐구 질문")
 
     st.write(
-        "한국 남자 축구 국가대표팀은 아시아 팀과 경기할 때와 "
-        "비아시아 팀과 경기할 때 승리율과 경기당 평균 득점에 차이가 있을까?"
+        "한국 남자 축구 국가대표팀은 아시아 팀과 비아시아 팀을 "
+        "상대로 경기할 때, 전반전 경기 상황이 최종 결과로 "
+        "이어지는 양상에 차이가 있을까?"
     )
 
 
@@ -509,11 +680,20 @@ st.caption(
 # 사이드바
 # ==========================================
 with st.sidebar:
-    st.header("데이터 설정")
-    st.write("데이터 출처: GitHub CSV")
-    st.code(DATA_URL, language=None)
 
-    if st.button("데이터 새로고침", use_container_width=True):
+    st.header("데이터 설정")
+
+    st.write("데이터 출처: GitHub CSV")
+
+    st.code(
+        DATA_URL,
+        language=None,
+    )
+
+    if st.button(
+        "데이터 새로고침",
+        use_container_width=True,
+    ):
         load_data.clear()
         st.rerun()
 
@@ -522,6 +702,7 @@ with st.sidebar:
     st.markdown(
         """
         **분석 항목**
+
         - 행·열 개수
         - 결측치와 자료형
         - 평균과 중앙값
@@ -538,6 +719,7 @@ with st.sidebar:
 df_raw, loaded_url, error = load_data()
 
 if df_raw is None:
+
     st.error("데이터를 불러오지 못했습니다.")
 
     st.write(
@@ -546,7 +728,9 @@ if df_raw is None:
     )
 
     with st.expander("오류 내용 보기"):
-        st.code(error or "원인을 확인할 수 없습니다.")
+        st.code(
+            error or "원인을 확인할 수 없습니다."
+        )
 
     st.info(
         "GitHub에서 CSV 파일을 열고 Raw 주소를 확인해 주세요."
@@ -561,7 +745,10 @@ df = prepare_numeric_columns(df_raw)
 # 데이터 기본 정보
 # ==========================================
 total_cells = df.shape[0] * df.shape[1]
-missing_cells = int(df.isna().sum().sum())
+
+missing_cells = int(
+    df.isna().sum().sum()
+)
 
 numeric_cols = df.select_dtypes(
     include="number"
@@ -578,15 +765,39 @@ category_cols = [
 # ==========================================
 m1, m2, m3, m4, m5 = st.columns(5)
 
-m1.metric("행 개수", f"{df.shape[0]:,}")
-m2.metric("열 개수", f"{df.shape[1]:,}")
-m3.metric("전체 결측치", f"{missing_cells:,}")
-m4.metric("수치형 열", f"{len(numeric_cols):,}")
-m5.metric("중복 행", f"{int(df.duplicated().sum()):,}")
+m1.metric(
+    "행 개수",
+    f"{df.shape[0]:,}",
+)
+
+m2.metric(
+    "열 개수",
+    f"{df.shape[1]:,}",
+)
+
+m3.metric(
+    "전체 결측치",
+    f"{missing_cells:,}",
+)
+
+m4.metric(
+    "수치형 열",
+    f"{len(numeric_cols):,}",
+)
+
+m5.metric(
+    "중복 행",
+    f"{int(df.duplicated().sum()):,}",
+)
 
 if missing_cells == 0:
-    st.success("현재 데이터에는 결측치가 없습니다.")
+
+    st.success(
+        "현재 데이터에는 결측치가 없습니다."
+    )
+
 else:
+
     st.warning(
         f"전체 {total_cells:,}개 셀 중 "
         f"{missing_cells:,}개가 비어 있습니다."
@@ -610,6 +821,7 @@ tabs = st.tabs([
 # 탭 1: 데이터 미리보기
 # ==========================================
 with tabs[0]:
+
     st.subheader("데이터 미리보기")
 
     st.write(
@@ -624,18 +836,23 @@ with tabs[0]:
 
     st.download_button(
         "분석에 사용한 데이터 CSV 다운로드",
-        data=df_raw.to_csv(index=False).encode("utf-8-sig"),
+        data=df_raw.to_csv(
+            index=False
+        ).encode("utf-8-sig"),
         file_name="축구_데이터.csv",
         mime="text/csv",
     )
 
     with st.expander("열 이름과 자료형"):
+
         schema = pd.DataFrame({
             "열 이름": df.columns,
+
             "자료형": [
                 str(df[col].dtype)
                 for col in df.columns
             ],
+
             "고유값 개수": [
                 int(df[col].nunique(dropna=True))
                 for col in df.columns
@@ -653,6 +870,7 @@ with tabs[0]:
 # 탭 2: 결측치와 자료형
 # ==========================================
 with tabs[1]:
+
     st.subheader("결측치 현황")
 
     missing_table = show_missing_table(df)
@@ -668,10 +886,17 @@ with tabs[1]:
     ]
 
     if has_missing.empty:
-        st.success("모든 열에 결측치가 없습니다.")
+
+        st.success(
+            "모든 열에 결측치가 없습니다."
+        )
+
     else:
+
         st.bar_chart(
-            has_missing.set_index("열 이름")[["결측치 개수"]],
+            has_missing.set_index(
+                "열 이름"
+            )[["결측치 개수"]],
             use_container_width=True,
         )
 
@@ -685,12 +910,17 @@ with tabs[1]:
 # 탭 3: 수치형 기초통계
 # ==========================================
 with tabs[2]:
+
     st.subheader("수치형 열의 기초통계")
 
     if not numeric_cols:
-        st.info("숫자로 인식된 열이 없습니다.")
+
+        st.info(
+            "숫자로 인식된 열이 없습니다."
+        )
 
     else:
+
         selected_numeric = st.multiselect(
             "통계를 볼 열 선택",
             options=numeric_cols,
@@ -698,7 +928,10 @@ with tabs[2]:
         )
 
         if selected_numeric:
-            stats = df[selected_numeric].describe().T
+
+            stats = df[
+                selected_numeric
+            ].describe().T
 
             stats = stats.rename(columns={
                 "count": "개수",
@@ -751,12 +984,17 @@ with tabs[2]:
 # 탭 4: 범주형 빈도 분석
 # ==========================================
 with tabs[3]:
+
     st.subheader("범주형 열의 빈도")
 
     if not category_cols:
-        st.info("범주형 열이 없습니다.")
+
+        st.info(
+            "범주형 열이 없습니다."
+        )
 
     else:
+
         selected_category = st.selectbox(
             "분석할 열 선택",
             category_cols,
@@ -790,7 +1028,9 @@ with tabs[3]:
         )
 
         st.bar_chart(
-            counts.set_index("항목")[["개수"]],
+            counts.set_index(
+                "항목"
+            )[["개수"]],
             use_container_width=True,
         )
 
@@ -799,9 +1039,11 @@ with tabs[3]:
 # 탭 5: 그래프와 상관관계
 # ==========================================
 with tabs[4]:
+
     st.subheader("수치형 열의 분포")
 
     if numeric_cols:
+
         chart_col = st.selectbox(
             "분포를 볼 수치형 열",
             numeric_cols,
@@ -810,13 +1052,23 @@ with tabs[4]:
         values = df[chart_col].dropna()
 
         if values.empty:
-            st.info("선택한 열에 분석할 숫자가 없습니다.")
+
+            st.info(
+                "선택한 열에 분석할 숫자가 없습니다."
+            )
 
         else:
-            bin_count = min(20, max(1, values.nunique()))
+
+            bin_count = min(
+                20,
+                max(1, values.nunique()),
+            )
 
             hist = (
-                pd.cut(values, bins=bin_count)
+                pd.cut(
+                    values,
+                    bins=bin_count,
+                )
                 .value_counts()
                 .sort_index()
             )
@@ -825,10 +1077,14 @@ with tabs[4]:
                 "구간"
             ).reset_index(name="개수")
 
-            hist_df["구간"] = hist_df["구간"].astype(str)
+            hist_df["구간"] = (
+                hist_df["구간"].astype(str)
+            )
 
             st.bar_chart(
-                hist_df.set_index("구간")[["개수"]],
+                hist_df.set_index(
+                    "구간"
+                )[["개수"]],
                 use_container_width=True,
             )
 
@@ -841,7 +1097,10 @@ with tabs[4]:
             )
 
         if len(numeric_cols) >= 2:
-            st.subheader("수치형 열 사이의 상관관계")
+
+            st.subheader(
+                "수치형 열 사이의 상관관계"
+            )
 
             corr = df[numeric_cols].corr(
                 numeric_only=True
@@ -858,6 +1117,7 @@ with tabs[4]:
             )
 
     else:
+
         st.info(
             "상관관계를 분석할 수 있는 수치형 열이 없습니다."
         )
@@ -867,6 +1127,7 @@ with tabs[4]:
 # 탭 6: 아시아 팀 vs 비아시아 팀
 # ==========================================
 with tabs[5]:
+
     show_asia_comparison(df)
 
 
@@ -875,7 +1136,9 @@ with tabs[5]:
 # ==========================================
 st.divider()
 
-st.caption(f"불러온 주소: {loaded_url}")
+st.caption(
+    f"불러온 주소: {loaded_url}"
+)
 
 st.caption(
     "기초통계는 데이터의 구조를 이해하기 위한 출발점입니다. "
