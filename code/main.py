@@ -10,6 +10,8 @@ from urllib.parse import unquote
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import (
@@ -17,8 +19,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     f1_score,
-    confusion_matrix,
-    classification_report
+    confusion_matrix
 )
 
 # ==========================================
@@ -38,10 +39,9 @@ DATA_URL = (
     "%25EC%25B6%2595%25EA%25B5%25AC.csv"
 )
 
+FEATURES = ["한국_전반득점", "상대_전반득점"]
 RESULTS = ["승리", "무승부", "패배"]
 SITUATIONS = ["앞섬", "동점", "뒤짐"]
-
-FEATURES = ["한국_전반득점", "상대_전반득점"]
 
 SCORE_COLUMNS = [
     "한국_전반득점",
@@ -63,9 +63,7 @@ REQUIRED_COLUMNS = [
 # ==========================================
 @st.cache_data
 def load_data():
-    urls = [DATA_URL, unquote(DATA_URL)]
-
-    for url in urls:
+    for url in [DATA_URL, unquote(DATA_URL)]:
         try:
             response = requests.get(url, timeout=20)
             response.raise_for_status()
@@ -77,247 +75,208 @@ def load_data():
                     )
                 except UnicodeDecodeError:
                     continue
-
         except Exception:
             continue
 
     return pd.DataFrame()
 
 
-df_original = load_data()
+original_df = load_data()
 
-if df_original.empty:
-    st.error("데이터를 불러오지 못했습니다. 데이터 주소를 확인해 주세요.")
+if original_df.empty:
+    st.error("데이터를 불러오지 못했습니다. GitHub 주소를 확인해 주세요.")
     st.stop()
 
 missing_columns = [
     col for col in REQUIRED_COLUMNS
-    if col not in df_original.columns
+    if col not in original_df.columns
 ]
 
 if missing_columns:
-    st.error(f"데이터에 필요한 열이 없습니다: {missing_columns}")
+    st.error(f"필요한 열이 없습니다: {missing_columns}")
     st.stop()
 
 
 # ==========================================
-# 3. 전처리 전 데이터 확인
+# 3. 전처리 함수
 # ==========================================
-df_before = df_original.copy()
+def preprocess_data(data):
+    df = data.copy()
 
-for col in SCORE_COLUMNS + ["연도"]:
-    df_before[col] = pd.to_numeric(
-        df_before[col], errors="coerce"
+    # 숫자형으로 변환
+    for col in SCORE_COLUMNS + ["연도"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 문자열 공백 정리
+    for col in ["상대팀", "대회", "전반전상황", "최종결과"]:
+        df[col] = df[col].astype("string").str.strip()
+        df[col] = df[col].replace("", pd.NA)
+
+    # 분석에 필요한 열의 결측치 제거
+    df = df.dropna(
+        subset=FEATURES + ["최종결과", "전반전상황"]
     )
 
-# ==========================================
-# 4. 전처리
-# ==========================================
-df_clean = df_original.copy()
+    # 중복 행 제거
+    df = df.drop_duplicates()
 
-# 숫자형으로 변환
-for col in SCORE_COLUMNS + ["연도"]:
-    df_clean[col] = pd.to_numeric(
-        df_clean[col], errors="coerce"
-    )
+    # 분석 대상 범주만 사용
+    df = df[
+        df["최종결과"].isin(RESULTS)
+        & df["전반전상황"].isin(SITUATIONS)
+    ].copy()
 
-# 문자열 공백 정리
-for col in ["상대팀", "대회", "전반전상황", "최종결과"]:
-    df_clean[col] = (
-        df_clean[col]
-        .astype("string")
-        .str.strip()
-    )
+    return df.reset_index(drop=True)
 
-# 빈 문자열은 결측치로 변경
-for col in ["상대팀", "대회", "전반전상황", "최종결과"]:
-    df_clean[col] = df_clean[col].replace("", pd.NA)
 
-rows_before = len(df_clean)
+clean_df = preprocess_data(original_df)
 
-# 분석에 꼭 필요한 열의 결측치가 있는 행 제거
-df_clean = df_clean.dropna(
-    subset=FEATURES + ["최종결과", "전반전상황"]
-)
-
-rows_after_missing = len(df_clean)
-
-# 중복 행 제거
-df_clean = df_clean.drop_duplicates()
-
-rows_after = len(df_clean)
-
-df_clean = df_clean.reset_index(drop=True)
-
-# 분석에 사용할 데이터
-analysis_df = df_clean[
-    df_clean["전반전상황"].isin(SITUATIONS)
-    & df_clean["최종결과"].isin(RESULTS)
-].copy()
-
-analysis_df = analysis_df.dropna(
-    subset=FEATURES + ["최종결과"]
-).reset_index(drop=True)
-
-if analysis_df.empty:
-    st.error("분석할 수 있는 데이터가 없습니다.")
+if clean_df.empty:
+    st.error("전처리 후 분석할 데이터가 없습니다.")
     st.stop()
 
 
 # ==========================================
-# 5. 이상치 탐색
+# 4. 모델 3개 선정
 # ==========================================
-outlier_info = []
+def make_models():
+    return {
+        "로지스틱 회귀": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(max_iter=3000))
+        ]),
 
-for col in SCORE_COLUMNS:
-    values = df_clean[col].dropna()
+        "의사결정트리": DecisionTreeClassifier(
+            max_depth=3,
+            random_state=42
+        ),
 
-    if len(values) == 0:
-        continue
-
-    q1 = values.quantile(0.25)
-    q3 = values.quantile(0.75)
-    iqr = q3 - q1
-
-    lower = q1 - 1.5 * iqr
-    upper = q3 + 1.5 * iqr
-
-    outlier_count = (
-        (values < lower) | (values > upper)
-    ).sum()
-
-    outlier_info.append({
-        "열 이름": col,
-        "1사분위수": q1,
-        "3사분위수": q3,
-        "이상치 판단 하한": lower,
-        "이상치 판단 상한": upper,
-        "이상치 후보 개수": int(outlier_count)
-    })
-
-outlier_df = pd.DataFrame(outlier_info)
+        "k-최근접 이웃": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", KNeighborsClassifier(n_neighbors=5))
+        ])
+    }
 
 
 # ==========================================
-# 6. 로지스틱 회귀와 베이스라인
+# 5. 모델 평가
 # ==========================================
-X = analysis_df[FEATURES]
-y = analysis_df["최종결과"]
+@st.cache_data
+def evaluate_models(data):
+    X = data[FEATURES]
+    y = data["최종결과"]
 
-class_counts = y.value_counts()
+    counts = y.value_counts()
 
-if len(class_counts) < 2 or class_counts.min() < 5:
+    if len(counts) < 2 or counts.min() < 5:
+        return None
+
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42
+    )
+
+    models = make_models()
+
+    # 베이스라인
+    baseline = DummyClassifier(
+        strategy="most_frequent"
+    )
+
+    baseline_predictions = cross_val_predict(
+        baseline,
+        X,
+        y,
+        cv=cv
+    )
+
+    predictions = {
+        "베이스라인": baseline_predictions
+    }
+
+    scores = [{
+        "모델": "베이스라인",
+        "정확도": accuracy_score(y, baseline_predictions),
+        "정밀도": precision_score(
+            y, baseline_predictions,
+            average="macro", zero_division=0
+        ),
+        "재현율": recall_score(
+            y, baseline_predictions,
+            average="macro", zero_division=0
+        ),
+        "F1 점수": f1_score(
+            y, baseline_predictions,
+            average="macro", zero_division=0
+        )
+    }]
+
+    for name, model in models.items():
+        pred = cross_val_predict(
+            model,
+            X,
+            y,
+            cv=cv
+        )
+
+        predictions[name] = pred
+
+        scores.append({
+            "모델": name,
+            "정확도": accuracy_score(y, pred),
+            "정밀도": precision_score(
+                y, pred,
+                average="macro", zero_division=0
+            ),
+            "재현율": recall_score(
+                y, pred,
+                average="macro", zero_division=0
+            ),
+            "F1 점수": f1_score(
+                y, pred,
+                average="macro", zero_division=0
+            )
+        })
+
+    score_df = pd.DataFrame(scores)
+
+    # 전체 데이터로 최종 모델 학습
+    fitted_models = make_models()
+
+    for model in fitted_models.values():
+        model.fit(X, y)
+
+    prediction_df = data[
+        ["날짜", "상대팀", "한국_전반득점", "상대_전반득점"]
+    ].copy()
+
+    prediction_df["실제 결과"] = y.values
+
+    for name in models:
+        prediction_df[name + " 예측"] = predictions[name]
+
+    return score_df, prediction_df, fitted_models
+
+
+evaluation = evaluate_models(clean_df)
+
+if evaluation is None:
     st.error(
-        "일부 결과의 경기 수가 부족하여 "
-        "5겹 교차검증을 수행할 수 없습니다."
+        "각 결과 범주의 경기 수가 부족하여 "
+        "5겹 교차검증을 진행할 수 없습니다."
     )
     st.stop()
 
-logistic_model = Pipeline([
-    ("scaler", StandardScaler()),
-    ("logistic", LogisticRegression(
-        max_iter=3000,
-        solver="lbfgs"
-    ))
-])
-
-baseline_model = DummyClassifier(
-    strategy="most_frequent"
-)
-
-cv = StratifiedKFold(
-    n_splits=5,
-    shuffle=True,
-    random_state=42
-)
-
-logistic_predictions = cross_val_predict(
-    logistic_model,
-    X,
-    y,
-    cv=cv,
-    method="predict"
-)
-
-baseline_predictions = cross_val_predict(
-    baseline_model,
-    X,
-    y,
-    cv=cv,
-    method="predict"
-)
-
-# 전체 데이터로 예측용 모델 학습
-logistic_model.fit(X, y)
-
-# 성능 계산
-logistic_accuracy = accuracy_score(
-    y, logistic_predictions
-)
-
-baseline_accuracy = accuracy_score(
-    y, baseline_predictions
-)
-
-logistic_precision = precision_score(
-    y,
-    logistic_predictions,
-    average="macro",
-    zero_division=0
-)
-
-logistic_recall = recall_score(
-    y,
-    logistic_predictions,
-    average="macro",
-    zero_division=0
-)
-
-logistic_f1 = f1_score(
-    y,
-    logistic_predictions,
-    average="macro",
-    zero_division=0
-)
-
-baseline_f1 = f1_score(
-    y,
-    baseline_predictions,
-    average="macro",
-    zero_division=0
-)
-
-accuracy_difference = (
-    logistic_accuracy - baseline_accuracy
-) * 100
-
-f1_difference = (
-    logistic_f1 - baseline_f1
-) * 100
-
-cm = confusion_matrix(
-    y,
-    logistic_predictions,
-    labels=RESULTS
-)
-
-report = classification_report(
-    y,
-    logistic_predictions,
-    labels=RESULTS,
-    output_dict=True,
-    zero_division=0
-)
-
-majority_result = y.value_counts().idxmax()
+score_df, prediction_df, fitted_models = evaluation
 
 
 # ==========================================
-# 7. 통계 계산
+# 6. 공통 통계
 # ==========================================
 counts = pd.crosstab(
-    analysis_df["전반전상황"],
-    analysis_df["최종결과"]
+    clean_df["전반전상황"],
+    clean_df["최종결과"]
 ).reindex(
     index=SITUATIONS,
     columns=RESULTS,
@@ -329,39 +288,36 @@ percentages = counts.div(
     axis=0
 ) * 100
 
-ahead_win_rate = percentages.loc["앞섬", "승리"]
-behind_loss_rate = percentages.loc["뒤짐", "패배"]
-
 
 # ==========================================
-# 8. 메뉴
+# 7. 메뉴
 # ==========================================
 st.title("⚽ 대한민국 축구 국가대표팀 경기 분석")
-
 st.caption(
-    "전반전 경기 상황과 최종 결과의 관계를 데이터로 알아본다."
+    "전반전 경기 상황과 최종 결과의 관계를 데이터로 분석한다."
 )
 
 menu = st.sidebar.radio(
     "분석 메뉴",
     [
         "탐구 주제",
-        "데이터 살펴보기·전처리",
-        "전반전 상황별 경기 수",
+        "데이터 살펴보기",
+        "데이터 전처리",
+        "모델 선정과 원리",
+        "모델 학습 결과 비교",
         "전반전 상황별 최종 결과",
-        "로지스틱 회귀 분석",
-        "경기 기록 확인",
+        "경기 기록",
         "최종 보고서"
     ]
 )
 
 
 # ==========================================
-# 9. 탐구 주제
+# 8. 탐구 주제
 # ==========================================
 if menu == "탐구 주제":
 
-    st.header("🔎 탐구 주제")
+    st.header("① 탐구 주제")
 
     st.subheader(
         "대한민국 축구 국가대표팀의 전반전 경기 상황에 따라 "
@@ -375,212 +331,125 @@ if menu == "탐구 주제":
     전반전에 앞서면 실제로 승리할 가능성이 높은지,
     뒤지고 있어도 역전할 수 있는지 데이터를 통해 확인하고 싶었다.
 
-    그래서 대한민국 축구 국가대표팀의 경기 기록을 이용하여
-    전반전 상황과 최종 결과의 관계를 분석하는 주제를 선택했다.
+    그래서 대한민국 축구 국가대표팀의 경기 기록을 활용하여
+    전반전 상황과 최종 결과의 관계를 분석하기로 했다.
     """)
 
-    st.subheader("분석 방법")
+    st.subheader("분석 목표")
 
     st.markdown("""
-    1. 대한민국 국가대표팀 경기 데이터를 수집한다.
-    2. 데이터의 결측치, 이상치, 편향을 확인한다.
-    3. 전반전 상황별 최종 결과 비율을 비교한다.
-    4. 로지스틱 회귀로 최종 결과를 분류한다.
-    5. 베이스라인과 모델 성능을 비교한다.
+    - 전반전 상황별 최종 결과의 비율을 비교한다.
+    - 전반전 득점을 이용해 최종 결과를 분류한다.
+    - 세 가지 분류 모델의 성능을 비교한다.
+    - 베이스라인보다 모델이 얼마나 나아졌는지 확인한다.
+    """)
+
+    st.subheader("회귀·분류·군집 중 무엇이 적합할까?")
+
+    st.markdown("""
+    **분류가 가장 적합하다.**
+
+    이번 탐구에서 예측하고 싶은 값은 최종 득점처럼 연속적인 숫자가 아니라
+    승리, 무승부, 패배라는 세 가지 범주이다.
+
+    따라서 범주를 예측하는 분류 모델을 사용한다.
+
+    - 회귀: 연속적인 숫자를 예측할 때 적합하다.
+    - 분류: 정해진 범주를 예측할 때 적합하다.
+    - 군집: 정답 없이 비슷한 데이터끼리 묶을 때 적합하다.
     """)
 
 
 # ==========================================
-# 10. 데이터 살펴보기·전처리
+# 9. 데이터 살펴보기
 # ==========================================
-elif menu == "데이터 살펴보기·전처리":
+elif menu == "데이터 살펴보기":
 
-    st.header("② 데이터 살펴보기·전처리")
-
-    st.info(
-        "데이터를 처음 열었을 때 발견한 점, 결측치와 이상치의 차이, "
-        "처리 기준, 편향 및 전처리 전후 변화를 확인한다."
-    )
-
-    # 행과 열
-    st.subheader("1. 데이터의 행과 열")
+    st.header("② 데이터 살펴보기")
 
     c1, c2, c3 = st.columns(3)
 
-    c1.metric("전처리 전 행 수", f"{len(df_before)}개")
-    c2.metric("열 수", f"{df_before.shape[1]}개")
-    c3.metric("전처리 후 행 수", f"{len(df_clean)}개")
+    c1.metric("원본 행 수", len(original_df))
+    c2.metric("열 수", original_df.shape[1])
+    c3.metric("분석 데이터 행 수", len(clean_df))
 
-    st.write(
-        f"원본 데이터는 **{df_before.shape[0]}행 "
-        f"{df_before.shape[1]}열**로 구성되어 있다."
+    st.subheader("원본 데이터")
+
+    st.dataframe(
+        original_df.head(10),
+        use_container_width=True
     )
 
-    st.subheader("원본 데이터 미리 보기")
-    st.dataframe(df_original.head(10), use_container_width=True)
+    st.subheader("데이터 속성별 유형")
 
-    # 결측치
-    st.divider()
-    st.subheader("2. 결측치 확인")
-
-    missing_table = pd.DataFrame({
-        "열 이름": df_original.columns,
-        "결측치 개수": [
-            int(df_original[col].isna().sum())
-            for col in df_original.columns
+    type_table = pd.DataFrame({
+        "속성": REQUIRED_COLUMNS,
+        "유형": [
+            "날짜형",
+            "수치형",
+            "범주형",
+            "범주형",
+            "수치형(이산형)",
+            "수치형(이산형)",
+            "수치형(이산형)",
+            "수치형(이산형)",
+            "범주형",
+            "범주형"
+        ],
+        "적합한 시각화": [
+            "선 그래프",
+            "막대그래프",
+            "막대그래프",
+            "막대그래프",
+            "막대그래프·산점도",
+            "막대그래프·산점도",
+            "막대그래프",
+            "막대그래프",
+            "막대그래프",
+            "막대그래프"
         ]
     })
 
-    st.dataframe(
-        missing_table,
-        use_container_width=True
+    st.dataframe(type_table, use_container_width=True)
+
+    st.subheader("결측치 확인")
+
+    missing_df = pd.DataFrame({
+        "열": original_df.columns,
+        "결측치 개수": [
+            int(original_df[col].isna().sum())
+            for col in original_df.columns
+        ]
+    })
+
+    st.dataframe(missing_df, use_container_width=True)
+
+    st.write(
+        f"전체 결측치 개수: **{int(original_df.isna().sum().sum())}개**"
     )
 
-    total_missing = int(df_original.isna().sum().sum())
 
-    st.write(f"전체 결측치 개수는 **{total_missing}개**이다.")
+# ==========================================
+# 10. 데이터 전처리
+# ==========================================
+elif menu == "데이터 전처리":
+
+    st.header("③ 데이터 전처리")
+
+    st.subheader("전처리 기준")
 
     st.markdown("""
-    **결측치와 이상치의 차이**
-
-    - 결측치: 데이터 값이 비어 있거나 기록되지 않은 경우
-    - 이상치: 다른 데이터와 비교했을 때 유난히 크거나 작은 값
-
-    결측치는 값이 없는 것이고, 이상치는 값이 존재하지만
-    다른 값들과 차이가 큰 경우라는 점에서 다르다.
+    1. 득점과 연도 열을 숫자형으로 변환한다.
+    2. 문자열 앞뒤의 공백을 제거한다.
+    3. 분석에 필요한 값이 비어 있는 행을 제거한다.
+    4. 중복 행을 제거한다.
+    5. 분석 대상인 승리·무승부·패배 기록만 사용한다.
+    6. 이상치 후보는 확인하되 실제 경기 기록일 수 있으므로 임의로 삭제하지 않는다.
     """)
 
-    st.subheader("결측치 처리 기준")
+    st.subheader("전처리 전후 비교")
 
-    st.write("""
-    이번 분석에서는 한국 전반전 득점, 상대 전반전 득점,
-    전반전 상황, 최종 결과처럼 분석에 꼭 필요한 값이 비어 있는
-    행을 제거하였다.
-
-    최종 결과가 없는 경기는 정답을 알 수 없으므로
-    모델 학습과 평가에 사용할 수 없기 때문이다.
-    """)
-
-    # 이상치
-    st.divider()
-    st.subheader("3. 이상치 확인")
-
-    st.write("""
-    이상치는 사분위 범위(IQR)를 이용하여 탐색하였다.
-
-    1사분위수에서 3사분위수를 뺀 값을 IQR이라고 한다.
-    IQR을 이용해 일반적인 범위를 벗어나는 값을 이상치 후보로 표시한다.
-    """)
-
-    if not outlier_df.empty:
-        st.dataframe(
-            outlier_df.round(2),
-            use_container_width=True
-        )
-
-        st.write(
-            "아래 그래프는 득점 데이터의 분포와 이상치 후보를 확인하기 위한 것이다."
-        )
-
-        selected_score = st.selectbox(
-            "확인할 득점 열",
-            SCORE_COLUMNS
-        )
-
-        fig_box = px.box(
-            df_clean,
-            y=selected_score,
-            points="all",
-            title=f"{selected_score} 분포와 이상치 후보"
-        )
-
-        st.plotly_chart(
-            fig_box,
-            use_container_width=True
-        )
-
-    st.subheader("이상치 처리 기준")
-
-    st.write("""
-    득점 데이터에서 큰 값이 발견되더라도 실제 경기에서 나온
-    정상적인 득점일 수 있다.
-
-    따라서 IQR 기준에 해당하는 값은 이상치 후보로만 표시하고,
-    실제 경기 기록을 확인하지 않은 상태에서 삭제하지 않았다.
-
-    즉, 이번 탐구에서는 이상치 후보를 확인하되
-    근거 없는 데이터 삭제는 하지 않았다.
-    """)
-
-    # 편향
-    st.divider()
-    st.subheader("4. 데이터의 편향 확인")
-
-    st.write("""
-    편향은 데이터가 특정 결과나 집단에 지나치게 많이 모여
-    균형이 맞지 않는 상태를 뜻한다.
-
-    이번 데이터에서는 승리, 무승부, 패배의 경기 수가
-    서로 다른지 확인하였다.
-    """)
-
-    class_distribution = (
-        analysis_df["최종결과"]
-        .value_counts()
-        .reindex(RESULTS, fill_value=0)
-        .reset_index()
-    )
-
-    class_distribution.columns = ["최종 결과", "경기 수"]
-
-    class_distribution["비율(%)"] = (
-        class_distribution["경기 수"]
-        / len(analysis_df) * 100
-    ).round(1)
-
-    st.dataframe(
-        class_distribution,
-        use_container_width=True
-    )
-
-    fig_bias = px.bar(
-        class_distribution,
-        x="최종 결과",
-        y="경기 수",
-        text="경기 수",
-        title="최종 결과별 경기 수",
-        color="최종 결과"
-    )
-
-    st.plotly_chart(
-        fig_bias,
-        use_container_width=True
-    )
-
-    min_count = class_distribution["경기 수"].min()
-    max_count = class_distribution["경기 수"].max()
-
-    if min_count == max_count:
-        st.write(
-            "세 결과의 경기 수가 같아 결과별 경기 수가 균형을 이룬다."
-        )
-    else:
-        st.write(
-            f"가장 많은 결과는 **{majority_result}**이고, "
-            f"가장 적은 결과와 경기 수 차이는 "
-            f"**{max_count - min_count}경기**이다."
-        )
-
-        st.write("""
-        따라서 결과별 경기 수에 차이가 있는 편향이 존재한다.
-        모델이 많은 결과를 더 잘 맞히는지 주의해서 살펴볼 필요가 있다.
-        """)
-
-    # 전처리 전후 비교
-    st.divider()
-    st.subheader("5. 전처리 전후 비교")
-
-    before_after = pd.DataFrame({
+    comparison = pd.DataFrame({
         "항목": [
             "행 수",
             "한국 전반전 득점 평균",
@@ -589,121 +458,379 @@ elif menu == "데이터 살펴보기·전처리":
             "상대 최종 득점 평균"
         ],
         "전처리 전": [
-            len(df_before),
-            df_before["한국_전반득점"].mean(),
-            df_before["상대_전반득점"].mean(),
-            df_before["한국_최종득점"].mean(),
-            df_before["상대_최종득점"].mean()
+            len(original_df),
+            pd.to_numeric(
+                original_df["한국_전반득점"],
+                errors="coerce"
+            ).mean(),
+            pd.to_numeric(
+                original_df["상대_전반득점"],
+                errors="coerce"
+            ).mean(),
+            pd.to_numeric(
+                original_df["한국_최종득점"],
+                errors="coerce"
+            ).mean(),
+            pd.to_numeric(
+                original_df["상대_최종득점"],
+                errors="coerce"
+            ).mean()
         ],
         "전처리 후": [
-            len(df_clean),
-            df_clean["한국_전반득점"].mean(),
-            df_clean["상대_전반득점"].mean(),
-            df_clean["한국_최종득점"].mean(),
-            df_clean["상대_최종득점"].mean()
+            len(clean_df),
+            clean_df["한국_전반득점"].mean(),
+            clean_df["상대_전반득점"].mean(),
+            clean_df["한국_최종득점"].mean(),
+            clean_df["상대_최종득점"].mean()
         ]
     })
 
     st.dataframe(
-        before_after.round(2),
+        comparison.round(2),
         use_container_width=True
     )
 
-    removed_rows = len(df_before) - len(df_clean)
+    st.subheader("최종 결과별 데이터 편향")
 
-    st.write(
-        f"전처리 과정에서 총 **{removed_rows}행**이 제거되었다."
-    )
-
-    st.write("""
-    필요한 값이 비어 있는 행과 중복 행을 제거한 뒤
-    행 수와 득점 평균이 어떻게 달라졌는지 비교하였다.
-
-    이상치 후보는 실제 경기 기록일 가능성이 있어 삭제하지 않았다.
-    """)
-
-    # 전처리 결정 로그
-    st.divider()
-    st.subheader("6. 전처리 결정 기록")
-
-    decision_log = """
-[전처리 결정 기록]
-
-1. 숫자형 열은 숫자 자료형으로 변환하였다.
-2. 문자열 열의 앞뒤 공백을 제거하였다.
-3. 분석에 필요한 전반전 득점과 최종 결과 등이 비어 있는 행은 제거하였다.
-4. 중복된 행은 제거하였다.
-5. 득점의 이상치 후보는 IQR 방식으로 확인하였다.
-6. 실제 경기 기록일 가능성이 있으므로 이상치 후보를 임의로 삭제하지 않았다.
-7. 최종 결과별 경기 수를 비교하여 데이터 편향을 확인하였다.
-8. 전처리 전후 행 수와 득점 평균을 비교하였다.
-9. 로지스틱 회귀에서는 StandardScaler를 학습 데이터에 맞춰 적용하도록 Pipeline을 사용하였다.
-10. 교차검증을 통해 모델을 평가하였다.
-"""
-
-    st.code(decision_log, language="text")
-
-    st.download_button(
-        "전처리 결정 기록 다운로드",
-        data=decision_log.encode("utf-8-sig"),
-        file_name="전처리_결정기록.txt",
-        mime="text/plain"
-    )
-
-    st.warning(
-        "GitHub 커밋은 본인 계정에서 직접 해야 한다. "
-        "아래 안내를 참고해 전처리 코드를 커밋하고 기록을 남기자."
-    )
-
-    st.code(
-        "git add main.py\n"
-        'git commit -m "데이터 전처리 및 분석 기능 추가"\n'
-        "git push",
-        language="bash"
-    )
-
-
-# ==========================================
-# 11. 전반전 상황별 경기 수
-# ==========================================
-elif menu == "전반전 상황별 경기 수":
-
-    st.header("📈 전반전 상황별 경기 수")
-
-    situation_counts = (
-        analysis_df["전반전상황"]
+    result_counts = (
+        clean_df["최종결과"]
         .value_counts()
-        .reindex(SITUATIONS, fill_value=0)
+        .reindex(RESULTS, fill_value=0)
         .reset_index()
     )
 
-    situation_counts.columns = ["전반전 상황", "경기 수"]
+    result_counts.columns = ["최종 결과", "경기 수"]
+
+    result_counts["비율(%)"] = (
+        result_counts["경기 수"] / len(clean_df) * 100
+    ).round(1)
+
+    st.dataframe(result_counts, use_container_width=True)
 
     fig = px.bar(
-        situation_counts,
-        x="전반전 상황",
+        result_counts,
+        x="최종 결과",
         y="경기 수",
         text="경기 수",
-        title="전반전 상황별 경기 수",
-        color="전반전 상황"
+        title="최종 결과별 경기 수"
     )
 
     st.plotly_chart(fig, use_container_width=True)
 
+    st.subheader("이상치 확인")
+
+    outlier_rows = []
+
+    for col in SCORE_COLUMNS:
+        values = clean_df[col].dropna()
+
+        q1 = values.quantile(0.25)
+        q3 = values.quantile(0.75)
+        iqr = q3 - q1
+
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+
+        count = int(
+            ((values < lower) | (values > upper)).sum()
+        )
+
+        outlier_rows.append({
+            "속성": col,
+            "이상치 후보 개수": count,
+            "하한": lower,
+            "상한": upper
+        })
+
     st.dataframe(
-        situation_counts,
+        pd.DataFrame(outlier_rows).round(2),
         use_container_width=True
+    )
+
+    st.write("""
+    이상치는 다른 데이터에 비해 유난히 크거나 작은 값이다.
+    결측치는 값이 비어 있는 경우라는 점에서 다르다.
+
+    득점이 크다는 이유만으로 잘못된 데이터라고 판단할 수 없으므로
+    이상치 후보를 표시하되 임의로 삭제하지 않았다.
+    """)
+
+    st.subheader("전처리된 데이터")
+
+    st.dataframe(clean_df, use_container_width=True)
+
+    st.download_button(
+        "전처리 데이터 다운로드",
+        data=clean_df.to_csv(
+            index=False
+        ).encode("utf-8-sig"),
+        file_name="전처리_축구데이터.csv",
+        mime="text/csv"
     )
 
 
 # ==========================================
-# 12. 전반전 상황별 최종 결과
+# 11. 모델 선정과 원리
+# ==========================================
+elif menu == "모델 선정과 원리":
+
+    st.header("④ 모델 선정과 원리")
+
+    st.subheader("왜 분류 모델을 선택했을까?")
+
+    st.write("""
+    이번 탐구의 목표는 전반전 득점을 바탕으로 최종 결과를
+    승리, 무승부, 패배 중 하나로 분류하는 것이다.
+
+    예측 대상이 세 가지 범주이므로 분류 모델이 적합하다.
+    """)
+
+    st.divider()
+
+    st.subheader("모델 1. 로지스틱 회귀")
+
+    st.write("""
+    로지스틱 회귀는 입력 데이터를 바탕으로 각 결과가 나올 확률을 계산한다.
+
+    한국과 상대 팀의 전반전 득점을 입력하면 승리, 무승부, 패배일
+    확률을 각각 계산하고 가장 높은 확률의 결과를 선택한다.
+    """)
+
+    st.code(
+        "입력: 한국 전반전 득점, 상대 전반전 득점\n"
+        "→ 각 결과의 확률 계산\n"
+        "→ 가장 높은 확률의 결과 선택",
+        language="text"
+    )
+
+    st.divider()
+
+    st.subheader("모델 2. 의사결정트리")
+
+    st.write("""
+    의사결정트리는 여러 질문을 던지며 데이터를 나누는 모델이다.
+
+    예를 들어 한국의 전반전 득점이 상대보다 높은지,
+    같은지, 낮은지 등을 기준으로 분류한다.
+
+    나무의 가지를 따라가면 어떤 조건으로 결과를 분류했는지
+    확인할 수 있다는 장점이 있다.
+    """)
+
+    st.code(
+        "전반전 득점 비교\n"
+        "→ 조건에 따라 데이터 분리\n"
+        "→ 승리 / 무승부 / 패배 분류",
+        language="text"
+    )
+
+    st.divider()
+
+    st.subheader("모델 3. k-최근접 이웃(kNN)")
+
+    st.write("""
+    kNN은 새로운 데이터와 가장 가까운 기존 데이터 k개를 찾고,
+    그 이웃들의 다수결로 결과를 분류한다.
+
+    이번 분석에서는 k=5로 설정하여 가장 가까운 경기 5개의
+    최종 결과를 참고한다.
+
+    거리 계산에서 큰 숫자의 영향이 지나치게 커지지 않도록
+    StandardScaler로 득점 데이터를 정규화한다.
+    """)
+
+    st.code(
+        "새로운 경기의 전반전 득점 입력\n"
+        "→ 기존 경기와 거리 계산\n"
+        "→ 가까운 5개 경기 선택\n"
+        "→ 다수결로 결과 분류",
+        language="text"
+    )
+
+    st.divider()
+
+    st.subheader("베이스라인 모델")
+
+    st.write("""
+    베이스라인은 가장 많이 등장한 최종 결과만 계속 예측하는
+    단순한 기준 모델이다.
+
+    세 분류 모델이 베이스라인보다 좋은 성능을 보이는지 비교한다.
+    """)
+
+
+# ==========================================
+# 12. 모델 학습 결과 비교
+# ==========================================
+elif menu == "모델 학습 결과 비교":
+
+    st.header("⑤ 모델 학습 결과 비교")
+
+    st.info(
+        "세 모델은 같은 데이터와 5겹 교차검증으로 평가했다. "
+        "각 점수는 검증 과정에서 나온 예측 결과를 기준으로 계산했다."
+    )
+
+    st.subheader("모델별 성능")
+
+    display_scores = score_df.copy()
+
+    for col in ["정확도", "정밀도", "재현율", "F1 점수"]:
+        display_scores[col] = (
+            display_scores[col] * 100
+        ).round(1)
+
+    st.dataframe(
+        display_scores,
+        use_container_width=True
+    )
+
+    st.subheader("모델별 정확도 비교")
+
+    fig_accuracy = px.bar(
+        display_scores,
+        x="모델",
+        y="정확도",
+        text="정확도",
+        title="모델별 정확도 비교",
+        color="모델"
+    )
+
+    st.plotly_chart(
+        fig_accuracy,
+        use_container_width=True
+    )
+
+    st.subheader("모델별 F1 점수 비교")
+
+    fig_f1 = px.bar(
+        display_scores,
+        x="모델",
+        y="F1 점수",
+        text="F1 점수",
+        title="모델별 매크로 F1 점수 비교",
+        color="모델"
+    )
+
+    st.plotly_chart(
+        fig_f1,
+        use_container_width=True
+    )
+
+    st.subheader("베이스라인보다 얼마나 나아졌을까?")
+
+    baseline_row = score_df[
+        score_df["모델"] == "베이스라인"
+    ].iloc[0]
+
+    model_rows = score_df[
+        score_df["모델"] != "베이스라인"
+    ]
+
+    best_model_row = model_rows.sort_values(
+        "F1 점수",
+        ascending=False
+    ).iloc[0]
+
+    difference = (
+        best_model_row["정확도"]
+        - baseline_row["정확도"]
+    ) * 100
+
+    st.write(
+        f"F1 점수가 가장 높은 모델은 **{best_model_row['모델']}**이다."
+    )
+
+    st.write(
+        f"베이스라인 정확도는 {baseline_row['정확도']:.1%}이고, "
+        f"가장 높은 F1 점수를 보인 모델의 정확도는 "
+        f"{best_model_row['정확도']:.1%}이다."
+    )
+
+    st.write(
+        f"정확도 차이는 **{difference:+.1f}%p**이다."
+    )
+
+    if difference > 0:
+        st.success("해당 모델의 정확도가 베이스라인보다 높다.")
+    elif difference < 0:
+        st.warning("해당 모델의 정확도가 베이스라인보다 낮다.")
+    else:
+        st.info("해당 모델과 베이스라인의 정확도가 같다.")
+
+    st.divider()
+
+    st.subheader("혼동 행렬")
+
+    selected_model = st.selectbox(
+        "확인할 모델",
+        ["로지스틱 회귀", "의사결정트리", "k-최근접 이웃"]
+    )
+
+    cm = confusion_matrix(
+        prediction_df["실제 결과"],
+        prediction_df[selected_model + " 예측"],
+        labels=RESULTS
+    )
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=[f"실제 {x}" for x in RESULTS],
+        columns=[f"예측 {x}" for x in RESULTS]
+    )
+
+    fig_cm = px.imshow(
+        cm_df,
+        text_auto=True,
+        aspect="auto",
+        color_continuous_scale="Blues",
+        title=f"{selected_model} 혼동 행렬"
+    )
+
+    st.plotly_chart(fig_cm, use_container_width=True)
+
+    st.write("""
+    혼동 행렬에서 행은 실제 결과이고 열은 모델의 예측 결과이다.
+    대각선에 있는 숫자는 실제 결과를 맞힌 경기 수를 뜻한다.
+    """)
+
+    st.subheader("실제 결과와 모델 예측 비교")
+
+    st.dataframe(
+        prediction_df,
+        use_container_width=True
+    )
+
+    st.download_button(
+        "모델 예측 결과 다운로드",
+        data=prediction_df.to_csv(
+            index=False
+        ).encode("utf-8-sig"),
+        file_name="모델별_예측결과.csv",
+        mime="text/csv"
+    )
+
+    st.warning("""
+    경기 수가 70개 정도로 많지 않기 때문에 결과를 일반화하기 어렵다.
+    모델 점수가 높더라도 모든 경기에서 정확하게 예측한다고 볼 수 없다.
+    """)
+
+
+# ==========================================
+# 13. 전반전 상황별 최종 결과
 # ==========================================
 elif menu == "전반전 상황별 최종 결과":
 
-    st.header("⚽ 전반전 상황별 최종 결과")
+    st.header("⑥ 전반전 상황별 최종 결과")
 
-    st.subheader("최종 결과 비율")
+    st.subheader("상황별 경기 수")
+
+    st.dataframe(
+        counts,
+        use_container_width=True
+    )
+
+    st.subheader("상황별 최종 결과 비율")
 
     st.dataframe(
         percentages.round(1),
@@ -722,260 +849,38 @@ elif menu == "전반전 상황별 최종 결과":
         y="비율",
         color="최종 결과",
         text=chart_df["비율"].round(1).astype(str) + "%",
-        title="전반전 상황에 따른 최종 결과 비율",
         barmode="stack",
-        category_orders={
-            "전반전상황": SITUATIONS,
-            "최종 결과": RESULTS
-        }
+        title="전반전 상황별 최종 결과 비율"
     )
 
     st.plotly_chart(fig, use_container_width=True)
 
-    count_df = counts.reset_index().melt(
-        id_vars="전반전상황",
-        var_name="최종 결과",
-        value_name="경기 수"
-    )
-
-    fig2 = px.bar(
-        count_df,
-        x="전반전상황",
-        y="경기 수",
-        color="최종 결과",
-        barmode="group",
-        title="전반전 상황별 최종 결과 경기 수"
-    )
-
-    st.plotly_chart(fig2, use_container_width=True)
-
-
-# ==========================================
-# 13. 로지스틱 회귀 분석
-# ==========================================
-elif menu == "로지스틱 회귀 분석":
-
-    st.header("🤖 로지스틱 회귀 분석")
-
     st.write("""
-    한국과 상대 팀의 전반전 득점을 입력 변수로 사용하여
-    최종 결과를 승리, 무승부, 패배로 분류한다.
+    전반전에 앞선 경기, 동점인 경기, 뒤진 경기에서
+    최종 결과의 비율이 어떻게 다른지 비교할 수 있다.
+
+    이 결과는 두 속성 사이의 관계를 보여 주며,
+    전반전 상황이 최종 결과의 원인이라고 단정할 수는 없다.
     """)
 
-    st.subheader("1. 모델 성능")
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("정확도", f"{logistic_accuracy:.1%}")
-    c2.metric("정밀도", f"{logistic_precision:.1%}")
-    c3.metric("재현율", f"{logistic_recall:.1%}")
-    c4.metric("F1 점수", f"{logistic_f1:.1%}")
-
-    st.divider()
-
-    st.subheader("2. 베이스라인과 비교")
-
-    baseline_table = pd.DataFrame({
-        "모델": ["베이스라인", "로지스틱 회귀"],
-        "정확도": [
-            baseline_accuracy * 100,
-            logistic_accuracy * 100
-        ],
-        "매크로 F1": [
-            baseline_f1 * 100,
-            logistic_f1 * 100
-        ]
-    }).round(1)
-
-    st.dataframe(
-        baseline_table,
-        use_container_width=True
-    )
-
-    comparison_chart = baseline_table.melt(
-        id_vars="모델",
-        var_name="평가 지표",
-        value_name="점수"
-    )
-
-    fig_compare = px.bar(
-        comparison_chart,
-        x="평가 지표",
-        y="점수",
-        color="모델",
-        barmode="group",
-        text=comparison_chart["점수"].astype(str) + "%",
-        title="베이스라인과 로지스틱 회귀 비교"
-    )
-
-    st.plotly_chart(
-        fig_compare,
-        use_container_width=True
-    )
-
-    st.write(
-        f"정확도 차이: **{accuracy_difference:+.1f}%p**"
-    )
-
-    st.write(
-        f"매크로 F1 점수 차이: **{f1_difference:+.1f}%p**"
-    )
-
-    st.divider()
-
-    st.subheader("3. 혼동 행렬")
-
-    cm_df = pd.DataFrame(
-        cm,
-        index=[f"실제 {r}" for r in RESULTS],
-        columns=[f"예측 {r}" for r in RESULTS]
-    )
-
-    fig_cm = px.imshow(
-        cm_df,
-        text_auto=True,
-        aspect="auto",
-        color_continuous_scale="Blues",
-        title="실제 결과와 예측 결과"
-    )
-
-    st.plotly_chart(fig_cm, use_container_width=True)
-
-    st.write("""
-    행은 실제 경기 결과, 열은 모델의 예측 결과이다.
-    대각선에 있는 숫자는 정답을 맞힌 경기 수를 뜻한다.
-    """)
-
-    st.divider()
-
-    st.subheader("4. 결과별 성능")
-
-    class_result = pd.DataFrame({
-        "결과": RESULTS,
-        "정밀도": [
-            report[r]["precision"] * 100 for r in RESULTS
-        ],
-        "재현율": [
-            report[r]["recall"] * 100 for r in RESULTS
-        ],
-        "F1 점수": [
-            report[r]["f1-score"] * 100 for r in RESULTS
-        ],
-        "실제 경기 수": [
-            int(report[r]["support"]) for r in RESULTS
-        ]
-    }).round(1)
-
-    st.dataframe(
-        class_result,
-        use_container_width=True
-    )
-
-    st.divider()
-
-    st.subheader("5. 전반전 점수로 최종 결과 예측")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        korea_score = st.number_input(
-            "한국 전반전 득점",
-            min_value=0,
-            max_value=20,
-            value=1
-        )
-
-    with col2:
-        opponent_score = st.number_input(
-            "상대 팀 전반전 득점",
-            min_value=0,
-            max_value=20,
-            value=0
-        )
-
-    if st.button("최종 결과 예측하기", type="primary"):
-
-        new_data = pd.DataFrame(
-            [[korea_score, opponent_score]],
-            columns=FEATURES
-        )
-
-        predicted = logistic_model.predict(new_data)[0]
-        probabilities = logistic_model.predict_proba(new_data)[0]
-
-        st.success(f"예측 결과: **{predicted}**")
-
-        probability_df = pd.DataFrame({
-            "최종 결과": logistic_model.classes_,
-            "예측 확률": probabilities * 100
-        })
-
-        probability_df["예측 확률"] = (
-            probability_df["예측 확률"].round(1)
-        )
-
-        fig_prob = px.bar(
-            probability_df,
-            x="최종 결과",
-            y="예측 확률",
-            text=probability_df["예측 확률"].astype(str) + "%",
-            title="최종 결과별 예측 확률",
-            color="최종 결과"
-        )
-
-        st.plotly_chart(fig_prob, use_container_width=True)
-
-        st.caption(
-            "예측 확률은 학습 데이터의 패턴을 바탕으로 한 값이며 "
-            "실제 경기 결과를 보장하지 않는다."
-        )
-
-    st.divider()
-
-    st.subheader("6. 실제 결과와 예측 결과")
-
-    comparison = analysis_df[
-        ["날짜", "상대팀", "한국_전반득점", "상대_전반득점"]
-    ].copy()
-
-    comparison["실제 결과"] = y.values
-    comparison["예측 결과"] = logistic_predictions
-    comparison["예측 성공"] = (
-        comparison["실제 결과"] == comparison["예측 결과"]
-    )
-
-    st.dataframe(
-        comparison,
-        use_container_width=True
-    )
-
-    st.download_button(
-        "예측 결과 CSV 다운로드",
-        data=comparison.to_csv(
-            index=False
-        ).encode("utf-8-sig"),
-        file_name="로지스틱_회귀_예측결과.csv",
-        mime="text/csv"
-    )
-
 
 # ==========================================
-# 14. 경기 기록 확인
+# 14. 경기 기록
 # ==========================================
-elif menu == "경기 기록 확인":
+elif menu == "경기 기록":
 
-    st.header("🗂️ 경기 기록 확인")
+    st.header("⑦ 경기 기록")
 
-    selected_situation = st.selectbox(
+    selected = st.selectbox(
         "전반전 상황 선택",
-        ["전체", "앞섬", "동점", "뒤짐"]
+        ["전체"] + SITUATIONS
     )
 
-    filtered = analysis_df.copy()
+    filtered = clean_df.copy()
 
-    if selected_situation != "전체":
+    if selected != "전체":
         filtered = filtered[
-            filtered["전반전상황"] == selected_situation
+            filtered["전반전상황"] == selected
         ]
 
     st.write(f"검색된 경기: {len(filtered)}경기")
@@ -991,7 +896,7 @@ elif menu == "경기 기록 확인":
 # ==========================================
 elif menu == "최종 보고서":
 
-    st.header("📝 최종 보고서")
+    st.header("⑧ 최종 보고서")
 
     st.subheader("1. 탐구 주제")
 
@@ -1000,175 +905,84 @@ elif menu == "최종 보고서":
     최종 경기 결과는 어떻게 달라질까?
     """)
 
-    st.subheader("2. 주제를 선택한 이유")
+    st.subheader("2. 분석 방법 선택 이유")
 
     st.write("""
-    평소 축구 경기를 보면서 전반전에 앞서거나 뒤지는 상황이
-    최종 경기 결과와 어떤 관계가 있는지 궁금했다.
+    최종 결과는 승리, 무승부, 패배라는 세 가지 범주이므로
+    회귀나 군집보다 분류가 적합하다고 판단했다.
 
-    전반전에 앞서면 실제로 승리할 가능성이 높은지,
-    뒤지고 있어도 역전할 수 있는지 데이터를 통해 확인하고 싶었다.
-
-    그래서 대한민국 축구 국가대표팀의 경기 데이터를 활용하여
-    전반전 상황과 최종 결과의 관계를 분석하는 주제를 선택했다.
+    로지스틱 회귀, 의사결정트리, k-최근접 이웃 세 모델을 선정했다.
+    각각 확률 계산, 조건에 따른 분리, 가까운 데이터의 다수결이라는
+    서로 다른 원리로 작동한다.
     """)
 
-    st.subheader("3. 데이터 살펴보기와 전처리")
+    st.subheader("3. 데이터 전처리")
 
-    st.write(
-        f"원본 데이터는 {len(df_original)}행 "
-        f"{df_original.shape[1]}열로 구성되어 있었다."
-    )
+    st.write(f"""
+    원본 데이터는 {len(original_df)}행 {original_df.shape[1]}열이다.
+    분석에 필요한 결측치와 중복 행을 정리한 후
+    {len(clean_df)}경기를 분석에 사용했다.
 
-    st.write(
-        f"분석에 필요한 열의 결측치와 중복 행을 확인하고 처리한 뒤 "
-        f"{len(df_clean)}행이 남았다."
-    )
-
-    st.write("""
-    결측치는 값이 비어 있는 경우이고, 이상치는 다른 데이터에 비해
-    유난히 크거나 작은 값이다.
-
-    분석에 필요한 값이 비어 있는 행은 제거하였고,
-    중복 행도 제거하였다.
-
-    득점의 이상치 후보는 IQR 방식으로 확인했지만
-    실제 경기에서 나온 득점일 수 있으므로 임의로 삭제하지 않았다.
-
-    또한 승리, 무승부, 패배의 경기 수를 비교하여
-    데이터의 편향 여부를 확인하였다.
+    이상치 후보는 확인했지만 실제 경기 기록일 수 있으므로
+    임의로 삭제하지 않았다.
     """)
 
-    st.subheader("4. 그래프와 숫자는 무엇을 뜻하는가?")
+    st.subheader("4. 모델 학습 결과")
 
-    st.write("""
-    전반전 상황별 결과 그래프는 전반전에 앞섬, 동점, 뒤짐이라는
-    세 가지 상황에서 최종 승리, 무승부, 패배가 각각 얼마나
-    나타났는지 보여 준다.
-    """)
+    report_scores = score_df.copy()
 
-    report_table = percentages.round(1).copy()
-    report_table.insert(
-        0,
-        "경기 수",
-        counts.sum(axis=1)
-    )
+    for col in ["정확도", "정밀도", "재현율", "F1 점수"]:
+        report_scores[col] = (
+            report_scores[col] * 100
+        ).round(1)
 
     st.dataframe(
-        report_table,
+        report_scores,
         use_container_width=True
     )
 
-    st.write(f"""
-    분석 결과, 전반전에 앞선 경기의 최종 승리 비율은
-    {ahead_win_rate:.1f}%였고, 전반전에 뒤진 경기의 최종 패배 비율은
-    {behind_loss_rate:.1f}%였다.
+    best_row = score_df[
+        score_df["모델"] != "베이스라인"
+    ].sort_values(
+        "F1 점수",
+        ascending=False
+    ).iloc[0]
 
-    로지스틱 회귀의 혼동 행렬은 실제 경기 결과와
-    모델이 예측한 결과가 얼마나 일치하는지를 보여 준다.
-    대각선의 숫자는 정답을 맞힌 경기 수를 뜻한다.
-    """)
-
-    cm_df = pd.DataFrame(
-        cm,
-        index=[f"실제 {r}" for r in RESULTS],
-        columns=[f"예측 {r}" for r in RESULTS]
+    st.write(
+        f"매크로 F1 점수가 가장 높은 모델은 "
+        f"**{best_row['모델']}**이다."
     )
 
-    fig_report_cm = px.imshow(
-        cm_df,
-        text_auto=True,
-        aspect="auto",
-        color_continuous_scale="Blues",
-        title="실제 결과와 예측 결과 비교"
-    )
-
-    st.plotly_chart(
-        fig_report_cm,
-        use_container_width=True
-    )
-
-    st.subheader("5. 베이스라인보다 얼마나 나아졌는가?")
-
-    st.write(f"""
-    베이스라인은 가장 많이 등장한 결과인 '{majority_result}'만
-    예측하는 단순한 기준 모델이다.
-
-    베이스라인 정확도는 {baseline_accuracy:.1%}이고,
-    로지스틱 회귀 정확도는 {logistic_accuracy:.1%}이다.
-
-    따라서 로지스틱 회귀의 정확도는 베이스라인보다
-    **{accuracy_difference:+.1f}%p** 차이가 났다.
-
-    매크로 F1 점수는 베이스라인 {baseline_f1:.1%},
-    로지스틱 회귀 {logistic_f1:.1%}였다.
-    """)
-
-    if accuracy_difference > 0:
-        st.write(
-            "로지스틱 회귀가 베이스라인보다 정확도가 높았다."
-        )
-    elif accuracy_difference < 0:
-        st.write(
-            "로지스틱 회귀가 베이스라인보다 정확도가 낮았다. "
-            "모델을 사용했다고 항상 성능이 향상되는 것은 아니다."
-        )
-    else:
-        st.write(
-            "두 모델의 정확도는 같았다."
-        )
-
-    st.subheader("6. 이 결과를 믿기 어려운 이유")
-
-    st.write(f"""
-    분석에 사용한 경기 수는 {len(analysis_df)}경기로 많지 않다.
-    또한 한국과 상대 팀의 전반전 득점 두 가지 변수만 사용했기 때문에
-    상대 팀의 실력, 경기 장소, 선수 구성, 퇴장 여부 등
-    다른 요소는 충분히 반영하지 못했다.
-
-    따라서 이번 결과가 모든 축구 경기에서도 똑같이 나타난다고
-    확신하기 어렵다.
-    """)
-
-    st.subheader("7. 이 결과에서 새롭게 알게 된 점")
-
-    st.write(f"""
-    전반전 상황별 분석을 통해 앞서고 있는 경기와 뒤지고 있는 경기에서
-    최종 결과의 비율이 다르게 나타난다는 점을 확인했다.
-
-    특히 전반전에 앞선 경기의 최종 승리 비율은
-    {ahead_win_rate:.1f}%였고, 뒤진 경기의 최종 패배 비율은
-    {behind_loss_rate:.1f}%였다.
-
-    또한 로지스틱 회귀와 베이스라인을 비교하면서
-    복잡한 모델을 사용하더라도 항상 성능이 좋아지는 것은 아니라는
-    점을 새롭게 알게 되었다.
-    """)
-
-    st.subheader("8. 느낀 점")
+    st.subheader("5. 결과를 믿기 어려운 이유")
 
     st.write("""
-    이번 탐구를 통해 축구 경기의 흐름을 단순한 느낌이 아니라
-    실제 데이터와 통계로 확인할 수 있었다.
+    분석 데이터의 경기 수가 많지 않고, 전반전 득점 두 가지 변수만
+    사용했기 때문에 상대 팀의 실력, 경기 장소, 선수 구성,
+    퇴장 여부 등 다른 요소를 충분히 반영하지 못했다.
 
-    데이터를 정리하고 그래프로 표현하면서 경기 상황별 차이를
-    더 쉽게 이해할 수 있었다.
-
-    또한 로지스틱 회귀를 이용해 최종 결과를 분류하고,
-    베이스라인과 비교하면서 머신러닝 모델의 성능을
-    객관적으로 평가하는 방법을 배웠다.
-
-    앞으로는 더 많은 경기 데이터와 다양한 변수를 활용하면
-    분석을 더 깊이 진행할 수 있을 것이라고 생각했다.
+    또한 데이터의 결과별 경기 수가 다를 수 있어
+    모델 평가 결과를 신중하게 해석해야 한다.
     """)
 
-    st.divider()
+    st.subheader("6. 새롭게 알게 된 점")
 
-    st.caption(
-        "자료: 대한민국 축구 국가대표팀 경기 데이터"
-    )
+    st.write("""
+    같은 데이터라도 모델마다 작동 원리가 다르고
+    예측 결과와 성능이 달라질 수 있다는 것을 알게 되었다.
 
-    st.caption(
-        "분석 방법: 데이터 전처리, 기술통계, "
-        "다중 로지스틱 회귀, 베이스라인 비교, 5겹 교차검증"
-    )
+    또한 베이스라인과 비교해야 모델이 실제로 도움이 되는지
+    판단할 수 있다는 점을 배웠다.
+    """)
+
+    st.subheader("7. 느낀 점")
+
+    st.write("""
+    이번 탐구를 통해 축구 경기의 흐름을 데이터로 분석하고,
+    여러 분류 모델을 직접 비교해 볼 수 있었다.
+
+    모델의 정확도만 보는 것이 아니라 정밀도, 재현율, F1 점수와
+    혼동 행렬도 함께 살펴보는 것이 중요하다는 점을 알게 되었다.
+
+    앞으로 더 많은 경기와 다양한 변수를 활용하면
+    분석 결과를 더 깊이 이해할 수 있을 것이라고 생각한다.
+    """)
