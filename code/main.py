@@ -3,7 +3,6 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
-import plotly.figure_factory as ff
 
 from io import StringIO
 from urllib.parse import unquote
@@ -11,6 +10,7 @@ from urllib.parse import unquote
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import (
     accuracy_score,
@@ -40,7 +40,6 @@ DATA_URL = (
 
 RESULTS = ["승리", "무승부", "패배"]
 SITUATIONS = ["앞섬", "동점", "뒤짐"]
-
 FEATURES = ["한국_전반득점", "상대_전반득점"]
 
 # ==========================================
@@ -108,16 +107,14 @@ analysis_df = df[
 
 analysis_df = analysis_df.dropna(
     subset=FEATURES + ["최종결과"]
-)
-
-analysis_df = analysis_df.reset_index(drop=True)
+).reset_index(drop=True)
 
 if analysis_df.empty:
     st.error("분석할 수 있는 데이터가 없습니다.")
     st.stop()
 
 # ==========================================
-# 로지스틱 회귀 모델
+# 모델 학습 및 평가
 # ==========================================
 X = analysis_df[FEATURES]
 y = analysis_df["최종결과"]
@@ -126,11 +123,13 @@ class_counts = y.value_counts()
 
 if len(class_counts) < 2 or class_counts.min() < 5:
     st.error(
-        "로지스틱 회귀를 수행하기에는 특정 결과의 경기 수가 부족합니다."
+        "특정 결과의 경기 수가 부족하여 5겹 교차검증을 "
+        "안정적으로 수행할 수 없습니다."
     )
     st.stop()
 
-model = Pipeline([
+# 로지스틱 회귀
+logistic_model = Pipeline([
     ("scaler", StandardScaler()),
     ("logistic", LogisticRegression(
         max_iter=3000,
@@ -138,16 +137,28 @@ model = Pipeline([
     ))
 ])
 
-# 5겹 교차검증
+# 베이스라인: 학습 데이터에서 가장 많은 결과만 예측
+baseline_model = DummyClassifier(
+    strategy="most_frequent"
+)
+
+# 두 모델에 동일한 교차검증 적용
 cv = StratifiedKFold(
     n_splits=5,
     shuffle=True,
     random_state=42
 )
 
-# 각 경기를 학습에 사용하지 않은 모델로 예측
-predictions = cross_val_predict(
-    model,
+logistic_predictions = cross_val_predict(
+    logistic_model,
+    X,
+    y,
+    cv=cv,
+    method="predict"
+)
+
+baseline_predictions = cross_val_predict(
+    baseline_model,
     X,
     y,
     cv=cv,
@@ -155,35 +166,94 @@ predictions = cross_val_predict(
 )
 
 # 전체 데이터로 최종 모델 학습
-model.fit(X, y)
+logistic_model.fit(X, y)
 
-accuracy = accuracy_score(y, predictions)
-precision = precision_score(
-    y, predictions, average="macro", zero_division=0
+# ==========================================
+# 성능 계산
+# ==========================================
+logistic_accuracy = accuracy_score(
+    y, logistic_predictions
 )
-recall = recall_score(
-    y, predictions, average="macro", zero_division=0
+
+baseline_accuracy = accuracy_score(
+    y, baseline_predictions
 )
-f1 = f1_score(
-    y, predictions, average="macro", zero_division=0
+
+logistic_precision = precision_score(
+    y,
+    logistic_predictions,
+    average="macro",
+    zero_division=0
 )
+
+logistic_recall = recall_score(
+    y,
+    logistic_predictions,
+    average="macro",
+    zero_division=0
+)
+
+logistic_f1 = f1_score(
+    y,
+    logistic_predictions,
+    average="macro",
+    zero_division=0
+)
+
+baseline_f1 = f1_score(
+    y,
+    baseline_predictions,
+    average="macro",
+    zero_division=0
+)
+
+accuracy_difference = (
+    logistic_accuracy - baseline_accuracy
+) * 100
+
+f1_difference = (
+    logistic_f1 - baseline_f1
+) * 100
 
 cm = confusion_matrix(
     y,
-    predictions,
+    logistic_predictions,
     labels=RESULTS
 )
 
 report = classification_report(
     y,
-    predictions,
+    logistic_predictions,
     labels=RESULTS,
     output_dict=True,
     zero_division=0
 )
 
+# 베이스라인에서 가장 많이 예측한 결과
+majority_result = y.value_counts().idxmax()
+
 # ==========================================
-# 제목 및 메뉴
+# 해석에 사용할 통계
+# ==========================================
+counts = pd.crosstab(
+    analysis_df["전반전상황"],
+    analysis_df["최종결과"]
+).reindex(
+    index=SITUATIONS,
+    columns=RESULTS,
+    fill_value=0
+)
+
+percentages = counts.div(
+    counts.sum(axis=1).replace(0, 1),
+    axis=0
+) * 100
+
+ahead_win_rate = percentages.loc["앞섬", "승리"]
+behind_loss_rate = percentages.loc["뒤짐", "패배"]
+
+# ==========================================
+# 메뉴
 # ==========================================
 st.title("⚽ 전반전 경기 상황과 최종 결과 분석")
 
@@ -228,20 +298,26 @@ if menu == "탐구 주제":
     최종 경기 결과를 분류할 수 있는지 알아본다.
     """)
 
+    st.subheader("주제를 선택한 이유")
+
+    st.write("""
+    평소 축구 경기를 보면서 전반전에 앞서거나 뒤지는 상황이
+    최종 경기 결과와 어떤 관계가 있는지 궁금했다.
+
+    전반전에 앞서고 있으면 실제로 승리할 가능성이 높은지,
+    반대로 뒤지고 있어도 역전할 수 있는지 데이터를 통해
+    직접 확인하고 싶어 이 주제를 선택했다.
+    """)
+
     st.subheader("분석 방법")
 
     st.markdown("""
     1. 대한민국 국가대표팀 경기 데이터를 수집한다.
-    2. 전반전 상황별 최종 결과의 비율을 비교한다.
+    2. 전반전 상황별 최종 결과 비율을 비교한다.
     3. 한국과 상대 팀의 전반전 득점을 입력 변수로 사용한다.
     4. 로지스틱 회귀 모델로 최종 결과를 분류한다.
-    5. 교차검증을 이용해 모델의 성능을 평가한다.
+    5. 베이스라인과 모델 성능을 비교한다.
     """)
-
-    st.info(
-        "로지스틱 회귀는 전반전 득점을 바탕으로 "
-        "최종 결과를 승리·무승부·패배로 분류하는 모델이다."
-    )
 
 # ==========================================
 # 2. 데이터 탐색
@@ -249,11 +325,11 @@ if menu == "탐구 주제":
 elif menu == "데이터 탐색":
     st.header("📊 데이터 탐색")
 
-    col1, col2, col3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
 
-    col1.metric("전체 데이터", f"{len(df)}경기")
-    col2.metric("분석 데이터", f"{len(analysis_df)}경기")
-    col3.metric("데이터 열 개수", f"{df.shape[1]}개")
+    c1.metric("원본 경기 수", f"{len(df)}경기")
+    c2.metric("분석 경기 수", f"{len(analysis_df)}경기")
+    c3.metric("데이터 열 개수", f"{df.shape[1]}개")
 
     st.subheader("데이터 미리 보기")
     st.dataframe(df.head(10), use_container_width=True)
@@ -272,7 +348,7 @@ elif menu == "데이터 탐색":
         use_container_width=True
     )
 
-    st.subheader("분석에 사용하는 변수")
+    st.subheader("모델에 사용하는 변수")
 
     st.write("""
     - 입력 변수: 한국_전반득점, 상대_전반득점
@@ -311,29 +387,20 @@ elif menu == "전반전 상황별 경기 수":
         use_container_width=True
     )
 
+    st.write("""
+    이 그래프는 전반전에 앞선 경기, 동점인 경기,
+    뒤진 경기의 수를 보여 준다.
+    """)
+
 # ==========================================
 # 4. 전반전 상황별 최종 결과
 # ==========================================
 elif menu == "전반전 상황별 최종 결과":
     st.header("⚽ 전반전 상황별 최종 결과")
 
-    counts = pd.crosstab(
-        analysis_df["전반전상황"],
-        analysis_df["최종결과"]
-    ).reindex(
-        index=SITUATIONS,
-        columns=RESULTS,
-        fill_value=0
-    )
-
-    percentages = counts.div(
-        counts.sum(axis=1).replace(0, 1),
-        axis=0
-    ) * 100
+    display_percentages = percentages.round(1).reset_index()
 
     st.subheader("최종 결과 비율")
-
-    display_percentages = percentages.round(1).reset_index()
 
     st.dataframe(
         display_percentages,
@@ -395,40 +462,18 @@ elif menu == "로지스틱 회귀 분석":
     st.header("🤖 로지스틱 회귀 분석")
 
     st.write("""
-    로지스틱 회귀는 입력된 데이터를 바탕으로
-    어떤 범주에 속할지 분류하는 머신러닝 방법이다.
-
-    이번 분석에서는 한국과 상대 팀의 전반전 득점을 입력하여
+    한국과 상대 팀의 전반전 득점을 입력하여
     최종 결과가 승리, 무승부, 패배 중 무엇인지 분류한다.
     """)
 
-    st.subheader("1. 모델에 사용하는 데이터")
-
-    col1, col2 = st.columns(2)
-
-    col1.metric("분석 경기 수", f"{len(analysis_df)}경기")
-    col2.metric("입력 변수 개수", "2개")
-
-    st.write("**입력 변수:**")
-    st.write("- 한국_전반득점")
-    st.write("- 상대_전반득점")
-
-    st.write("**예측 대상:** 승리 / 무승부 / 패배")
-
-    st.divider()
-
-    st.subheader("2. 모델 성능")
-
-    st.caption(
-        "5겹 교차검증으로 각 경기의 예측 결과를 만들고 평가했다."
-    )
+    st.subheader("1. 모델 성능")
 
     c1, c2, c3, c4 = st.columns(4)
 
-    c1.metric("정확도", f"{accuracy:.1%}")
-    c2.metric("정밀도", f"{precision:.1%}")
-    c3.metric("재현율", f"{recall:.1%}")
-    c4.metric("F1 점수", f"{f1:.1%}")
+    c1.metric("정확도", f"{logistic_accuracy:.1%}")
+    c2.metric("정밀도", f"{logistic_precision:.1%}")
+    c3.metric("재현율", f"{logistic_recall:.1%}")
+    c4.metric("F1 점수", f"{logistic_f1:.1%}")
 
     st.write("""
     - 정확도: 전체 경기 중 정답을 맞힌 비율
@@ -436,6 +481,79 @@ elif menu == "로지스틱 회귀 분석":
     - 재현율: 실제 특정 결과인 경기 중 모델이 찾아낸 비율
     - F1 점수: 정밀도와 재현율을 함께 고려한 점수
     """)
+
+    st.divider()
+
+    st.subheader("2. 베이스라인과 비교")
+
+    st.write("""
+    베이스라인은 복잡한 분석을 하지 않고
+    학습 데이터에서 가장 많이 등장한 결과만 예측하는 기준 모델이다.
+
+    두 모델은 동일한 5겹 교차검증으로 평가하였다.
+    """)
+
+    baseline_table = pd.DataFrame({
+        "모델": ["베이스라인", "로지스틱 회귀"],
+        "정확도": [
+            baseline_accuracy * 100,
+            logistic_accuracy * 100
+        ],
+        "매크로 F1": [
+            baseline_f1 * 100,
+            logistic_f1 * 100
+        ]
+    }).round(1)
+
+    st.dataframe(
+        baseline_table,
+        use_container_width=True
+    )
+
+    comparison_chart = baseline_table.melt(
+        id_vars="모델",
+        var_name="평가 지표",
+        value_name="점수"
+    )
+
+    fig_compare = px.bar(
+        comparison_chart,
+        x="평가 지표",
+        y="점수",
+        color="모델",
+        barmode="group",
+        text=comparison_chart["점수"].astype(str) + "%",
+        title="베이스라인과 로지스틱 회귀 성능 비교"
+    )
+
+    st.plotly_chart(
+        fig_compare,
+        use_container_width=True
+    )
+
+    if accuracy_difference > 0:
+        st.success(
+            f"로지스틱 회귀의 정확도가 베이스라인보다 "
+            f"{accuracy_difference:.1f}%p 높다."
+        )
+    elif accuracy_difference < 0:
+        st.warning(
+            f"로지스틱 회귀의 정확도가 베이스라인보다 "
+            f"{abs(accuracy_difference):.1f}%p 낮다."
+        )
+    else:
+        st.info(
+            "로지스틱 회귀와 베이스라인의 정확도가 같다."
+        )
+
+    st.write(
+        f"매크로 F1 점수 차이: {f1_difference:+.1f}%p"
+    )
+
+    st.caption(
+        "정확도 차이는 퍼센트포인트(%p)로 표시한다. "
+        "두 모델의 성능은 동일한 교차검증 방식으로 비교했다."
+    )
 
     st.divider()
 
@@ -455,12 +573,16 @@ elif menu == "로지스틱 회귀 분석":
         title="로지스틱 회귀 혼동 행렬"
     )
 
-    st.plotly_chart(fig_cm, use_container_width=True)
-
-    st.caption(
-        "행은 실제 경기 결과, 열은 모델이 예측한 결과를 의미한다. "
-        "대각선에 있는 숫자가 정답으로 분류한 경기 수이다."
+    st.plotly_chart(
+        fig_cm,
+        use_container_width=True
     )
+
+    st.write("""
+    행은 실제 경기 결과, 열은 모델이 예측한 결과를 뜻한다.
+    대각선에 있는 숫자는 모델이 정답을 맞힌 경기 수이고,
+    대각선 밖의 숫자는 잘못 분류한 경기 수이다.
+    """)
 
     st.divider()
 
@@ -469,23 +591,18 @@ elif menu == "로지스틱 회귀 분석":
     class_result = pd.DataFrame({
         "결과": RESULTS,
         "정밀도": [
-            report[r]["precision"] for r in RESULTS
+            report[r]["precision"] * 100 for r in RESULTS
         ],
         "재현율": [
-            report[r]["recall"] for r in RESULTS
+            report[r]["recall"] * 100 for r in RESULTS
         ],
         "F1 점수": [
-            report[r]["f1-score"] for r in RESULTS
+            report[r]["f1-score"] * 100 for r in RESULTS
         ],
         "실제 경기 수": [
             int(report[r]["support"]) for r in RESULTS
         ]
-    })
-
-    for col in ["정밀도", "재현율", "F1 점수"]:
-        class_result[col] = (
-            class_result[col] * 100
-        ).round(1)
+    }).round(1)
 
     st.dataframe(
         class_result,
@@ -496,29 +613,22 @@ elif menu == "로지스틱 회귀 분석":
 
     st.subheader("5. 전반전 점수로 최종 결과 예측하기")
 
-    st.write(
-        "전반전 점수를 직접 입력하면 학습된 모델이 "
-        "최종 결과를 어떻게 분류하는지 확인할 수 있다."
-    )
+    col1, col2 = st.columns(2)
 
-    input_col1, input_col2 = st.columns(2)
-
-    with input_col1:
+    with col1:
         korea_score = st.number_input(
             "한국 전반전 득점",
             min_value=0,
             max_value=20,
-            value=1,
-            step=1
+            value=1
         )
 
-    with input_col2:
+    with col2:
         opponent_score = st.number_input(
             "상대 팀 전반전 득점",
             min_value=0,
             max_value=20,
-            value=0,
-            step=1
+            value=0
         )
 
     if st.button("최종 결과 예측하기", type="primary"):
@@ -527,13 +637,13 @@ elif menu == "로지스틱 회귀 분석":
             columns=FEATURES
         )
 
-        predicted = model.predict(new_data)[0]
-        probabilities = model.predict_proba(new_data)[0]
+        predicted = logistic_model.predict(new_data)[0]
+        probabilities = logistic_model.predict_proba(new_data)[0]
 
         st.success(f"모델의 예측 결과: **{predicted}**")
 
         probability_df = pd.DataFrame({
-            "최종 결과": model.classes_,
+            "최종 결과": logistic_model.classes_,
             "예측 확률": probabilities * 100
         })
 
@@ -556,8 +666,8 @@ elif menu == "로지스틱 회귀 분석":
         )
 
         st.caption(
-            "예측 확률은 모델이 학습한 데이터의 패턴을 바탕으로 "
-            "계산한 값이며 실제 경기 결과를 보장하지 않는다."
+            "이 확률은 학습 데이터의 패턴을 바탕으로 계산한 값이며 "
+            "실제 경기 결과를 보장하지 않는다."
         )
 
     st.divider()
@@ -569,7 +679,7 @@ elif menu == "로지스틱 회귀 분석":
     ].copy()
 
     comparison["실제 결과"] = y.values
-    comparison["예측 결과"] = predictions
+    comparison["예측 결과"] = logistic_predictions
     comparison["예측 성공"] = (
         comparison["실제 결과"] == comparison["예측 결과"]
     )
@@ -619,51 +729,64 @@ elif menu == "경기 기록 확인":
 elif menu == "결과 해석":
     st.header("💡 결과 해석")
 
-    counts = pd.crosstab(
-        analysis_df["전반전상황"],
-        analysis_df["최종결과"]
-    ).reindex(
-        index=SITUATIONS,
-        columns=RESULTS,
-        fill_value=0
+    st.subheader("전반전 상황별 최종 결과")
+
+    st.dataframe(
+        percentages.round(1),
+        use_container_width=True
     )
 
-    percentages = counts.div(
-        counts.sum(axis=1).replace(0, 1),
-        axis=0
-    ) * 100
+    st.write(f"""
+    전반전에 앞선 경기의 최종 승리 비율은
+    {ahead_win_rate:.1f}%였다.
 
-    for situation in SITUATIONS:
-        game_count = int(counts.loc[situation].sum())
-
-        if game_count == 0:
-            continue
-
-        st.subheader(f"전반전 {situation}")
-
-        for result in RESULTS:
-            count = int(counts.loc[situation, result])
-            percent = percentages.loc[situation, result]
-
-            st.write(
-                f"- 최종 {result}: {count}경기 ({percent:.1f}%)"
-            )
+    전반전에 뒤진 경기의 최종 패배 비율은
+    {behind_loss_rate:.1f}%였다.
+    """)
 
     st.divider()
 
-    st.subheader("로지스틱 회귀 분석 결과")
+    st.subheader("로지스틱 회귀와 베이스라인 비교")
 
     st.write(f"""
-    로지스틱 회귀 모델의 교차검증 정확도는 **{accuracy:.1%}**,
-    매크로 F1 점수는 **{f1:.1%}**로 나타났다.
+    베이스라인 정확도는 {baseline_accuracy:.1%}이고,
+    로지스틱 회귀 정확도는 {logistic_accuracy:.1%}이다.
 
-    이 점수는 전반전 득점만으로 최종 결과를 분류했을 때의
-    성능을 나타낸다.
+    따라서 로지스틱 회귀의 정확도는 베이스라인보다
+    {accuracy_difference:+.1f}%p 차이가 났다.
+
+    매크로 F1 점수는 베이스라인 {baseline_f1:.1%},
+    로지스틱 회귀 {logistic_f1:.1%}로 나타났다.
     """)
 
+    if accuracy_difference > 0:
+        st.write(
+            "로지스틱 회귀가 베이스라인보다 정확도에서 "
+            "더 좋은 결과를 보였다."
+        )
+    elif accuracy_difference < 0:
+        st.write(
+            "로지스틱 회귀가 베이스라인보다 정확도에서 "
+            "낮은 결과를 보였다. 복잡한 모델을 사용했다고 "
+            "항상 성능이 좋아지는 것은 아니라는 점을 알 수 있다."
+        )
+    else:
+        st.write(
+            "두 모델의 정확도가 같았다. "
+            "현재 데이터에서는 로지스틱 회귀의 추가적인 "
+            "정확도 향상이 나타나지 않았다."
+        )
+
+    st.divider()
+
+    st.subheader("분석의 한계")
+
     st.write("""
-    다만 경기 수가 적고 승리, 무승부, 패배의 경기 수에도 차이가 있으므로
-    모델의 성능을 일반화하기에는 한계가 있다.
+    분석에 사용한 경기 수가 많지 않고, 전반전 득점 두 가지 변수만
+    사용했기 때문에 상대 팀의 실력이나 경기 장소 등 다른 요소를
+    충분히 반영하지 못했다.
+
+    따라서 모델의 결과를 모든 축구 경기에 적용하기는 어렵다.
     """)
 
 # ==========================================
@@ -672,44 +795,32 @@ elif menu == "결과 해석":
 elif menu == "최종 보고서":
     st.header("📝 최종 보고서")
 
-    counts = pd.crosstab(
-        analysis_df["전반전상황"],
-        analysis_df["최종결과"]
-    ).reindex(
-        index=SITUATIONS,
-        columns=RESULTS,
-        fill_value=0
+    st.caption(
+        "탐구 질문에 대한 답변을 실제 데이터 분석 결과를 바탕으로 정리했다."
     )
 
-    percentages = counts.div(
-        counts.sum(axis=1).replace(0, 1),
-        axis=0
-    ) * 100
-
-    st.subheader("1. 탐구 주제")
+    # 1. 주제 선택 이유
+    st.subheader("1. 주제를 왜 이것으로 정했습니까?")
 
     st.write("""
-    대한민국 축구 국가대표팀의 전반전 경기 상황에 따라
-    최종 경기 결과는 어떻게 달라질까?
+    평소 축구 경기를 보면서 전반전에 앞서거나 뒤지는 상황이
+    최종 경기 결과에 어떤 영향을 주는지 궁금했다.
+
+    전반전에 앞서면 실제로 승리할 가능성이 높은지,
+    뒤지고 있어도 역전할 수 있는지 직접 확인하고 싶었다.
+
+    그래서 대한민국 축구 국가대표팀의 경기 데이터를 이용해
+    전반전 상황과 최종 결과의 관계를 분석하는 주제를 선택했다.
     """)
 
-    st.subheader("2. 분석 방법")
+    # 2. 그래프와 숫자의 의미
+    st.subheader("2. 이 그래프와 숫자는 무엇을 뜻합니까?")
 
     st.write("""
-    2021년부터 2025년까지의 대한민국 축구 국가대표팀 경기 데이터를
-    활용하였다.
-
-    먼저 전반전 상황을 앞섬, 동점, 뒤짐으로 나누어
-    각 상황에서 최종 승리, 무승부, 패배가 나타난 비율을 비교하였다.
-
-    다음으로 한국과 상대 팀의 전반전 득점을 입력 변수로,
-    최종 경기 결과를 예측 대상으로 설정하여 다중 로지스틱 회귀를
-    수행하였다.
-
-    모델 평가는 5겹 교차검증을 이용하였다.
+    전반전 상황별 최종 결과 비율 그래프는 전반전에 앞섬,
+    동점, 뒤짐이라는 세 가지 상황에서 최종 승리, 무승부,
+    패배가 각각 얼마나 나타났는지 보여 준다.
     """)
-
-    st.subheader("3. 전반전 상황별 분석 결과")
 
     report_table = percentages.round(1).copy()
     report_table.insert(
@@ -723,101 +834,146 @@ elif menu == "최종 보고서":
         use_container_width=True
     )
 
-    for situation in SITUATIONS:
-        game_count = int(counts.loc[situation].sum())
+    st.write(f"""
+    분석 결과, 전반전에 앞선 경기의 최종 승리 비율은
+    {ahead_win_rate:.1f}%였고, 전반전에 뒤진 경기의 최종 패배 비율은
+    {behind_loss_rate:.1f}%였다.
 
-        if game_count == 0:
-            continue
+    로지스틱 회귀의 혼동 행렬은 실제 경기 결과와 모델이 예측한
+    경기 결과가 얼마나 일치하는지 보여 준다.
+    대각선의 숫자가 클수록 해당 결과를 정확히 분류한 경기가 많다는 뜻이다.
+    """)
 
-        win_count = int(counts.loc[situation, "승리"])
-        draw_count = int(counts.loc[situation, "무승부"])
-        loss_count = int(counts.loc[situation, "패배"])
+    st.image if False else None
 
-        st.markdown(f"**전반전 {situation}**")
+    cm_df = pd.DataFrame(
+        cm,
+        index=[f"실제 {r}" for r in RESULTS],
+        columns=[f"예측 {r}" for r in RESULTS]
+    )
 
-        st.write(
-            f"{game_count}경기 중 최종 승리는 {win_count}경기, "
-            f"무승부는 {draw_count}경기, 패배는 {loss_count}경기였다."
-        )
+    fig_report_cm = px.imshow(
+        cm_df,
+        text_auto=True,
+        aspect="auto",
+        color_continuous_scale="Blues",
+        title="실제 결과와 예측 결과 비교"
+    )
 
-    st.subheader("4. 로지스틱 회귀 분석 결과")
+    st.plotly_chart(
+        fig_report_cm,
+        use_container_width=True
+    )
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-
-    metric_col1.metric("정확도", f"{accuracy:.1%}")
-    metric_col2.metric("정밀도", f"{precision:.1%}")
-    metric_col3.metric("F1 점수", f"{f1:.1%}")
+    # 3. 베이스라인보다 얼마나 나아졌는가?
+    st.subheader("3. 아무 모델도 쓰지 않았을 때보다 얼마나 나아졌습니까?")
 
     st.write(f"""
-    로지스틱 회귀 모델의 5겹 교차검증 결과 정확도는
-    **{accuracy:.1%}**로 나타났다.
+    베이스라인은 학습 데이터에서 가장 많이 등장한
+    '{majority_result}'만 예측하는 단순한 기준 모델이다.
 
-    매크로 정밀도는 **{precision:.1%}**,
-    매크로 재현율은 **{recall:.1%}**,
-    매크로 F1 점수는 **{f1:.1%}**였다.
+    베이스라인 정확도는 {baseline_accuracy:.1%}이고,
+    로지스틱 회귀 정확도는 {logistic_accuracy:.1%}이다.
 
-    이를 통해 전반전 득점 정보를 이용하여 최종 경기 결과를
-    어느 정도 분류할 수 있는지 확인하였다.
+    따라서 로지스틱 회귀는 베이스라인보다
+    **{accuracy_difference:+.1f}%p** 차이가 났다.
     """)
 
-    st.subheader("5. 결론")
+    baseline_report = pd.DataFrame({
+        "모델": ["베이스라인", "로지스틱 회귀"],
+        "정확도": [
+            baseline_accuracy * 100,
+            logistic_accuracy * 100
+        ],
+        "매크로 F1 점수": [
+            baseline_f1 * 100,
+            logistic_f1 * 100
+        ]
+    }).round(1)
 
-    st.write("""
-    전반전 상황별 비율을 비교한 결과, 전반전에 앞서고 있었던 경기에서는
-    최종 승리 비율이 높게 나타났으며, 뒤지고 있었던 경기에서는
-    최종 패배 비율이 높게 나타났다.
+    st.dataframe(
+        baseline_report,
+        use_container_width=True
+    )
 
-    로지스틱 회귀를 활용하여 전반전 득점으로 최종 결과를 분류하는
-    모델도 만들 수 있었다.
+    if accuracy_difference > 0:
+        st.success(
+            "로지스틱 회귀가 베이스라인보다 정확도가 높았다."
+        )
+    elif accuracy_difference < 0:
+        st.warning(
+            "로지스틱 회귀가 베이스라인보다 정확도가 낮았다. "
+            "모델을 사용했다고 반드시 성능이 향상되는 것은 아니다."
+        )
+    else:
+        st.info(
+            "두 모델의 정확도는 같았다."
+        )
 
-    따라서 전반전 득점 상황은 최종 경기 결과와 관련된 정보를
-    포함하고 있음을 확인하였다.
+    st.write(f"""
+    정확도뿐 아니라 매크로 F1 점수도 비교하였다.
+    베이스라인은 {baseline_f1:.1%}, 로지스틱 회귀는
+    {logistic_f1:.1%}였다.
+
+    이를 통해 전체 정답률뿐 아니라 승리, 무승부, 패배를
+    각각 얼마나 균형 있게 분류하는지도 확인하였다.
     """)
 
-    st.subheader("6. 한계")
+    # 4. 믿을 수 없는 이유
+    st.subheader("4. 이 결과를 믿을 수 없는 이유를 하나 말해 보십시오.")
 
-    st.write("""
-    첫째, 분석에 사용한 경기가 70경기로 많지 않기 때문에
-    다른 경기에도 같은 결과가 나타난다고 단정하기 어렵다.
+    st.write(f"""
+    가장 큰 한계는 분석에 사용한 데이터가
+    {len(analysis_df)}경기로 많지 않다는 점이다.
 
-    둘째, 승리, 무승부, 패배의 경기 수가 서로 다르기 때문에
-    모델이 특정 결과를 더 잘 분류할 가능성이 있다.
+    또한 모델은 한국과 상대 팀의 전반전 득점만 사용했다.
+    상대 팀의 실력, 경기 장소, 선수 구성, 퇴장 여부 등
+    다른 경기 요인은 반영하지 못했다.
 
-    셋째, 상대 팀의 실력, 경기 장소, 선수 구성, 퇴장 여부 등
-    최종 결과에 영향을 줄 수 있는 다른 요소는 고려하지 않았다.
-
-    넷째, 교차검증 점수는 현재 수집한 데이터 안에서 평가한 결과이므로
-    앞으로 진행될 경기에서도 같은 성능이 나온다는 보장은 없다.
-
-    따라서 분석 결과를 모든 축구 경기에 일반화해서는 안 된다.
+    따라서 이번 결과가 모든 국가대표팀 경기에서도
+    똑같이 나타난다고 확신할 수 없다.
     """)
 
-    st.subheader("7. 느낀 점")
+    # 5. 새롭게 알게 된 점
+    st.subheader("5. 이 결과에서 무엇을 새로 알게 되었습니까?")
+
+    st.write(f"""
+    전반전 상황별 분석을 통해 앞서고 있는 경기와 뒤지고 있는 경기에서
+    최종 결과의 비율이 다르게 나타난다는 점을 확인했다.
+
+    특히 전반전에 앞선 경기의 최종 승리 비율은
+    {ahead_win_rate:.1f}%였으며, 뒤진 경기의 최종 패배 비율은
+    {behind_loss_rate:.1f}%였다.
+
+    또한 전반전 득점만으로 최종 결과를 분류하는 로지스틱 회귀 모델을
+    만들고, 베이스라인과 비교하면서 복잡한 모델을 사용하더라도
+    항상 성능이 좋아지는 것은 아니라는 점을 알게 되었다.
+    """)
+
+    st.subheader("6. 느낀 점")
 
     st.write("""
-    이번 탐구를 통해 축구 경기의 전반전 상황과 최종 결과 사이의
-    관계를 실제 데이터로 분석할 수 있었다.
+    이번 탐구를 통해 축구 경기의 흐름을 단순한 느낌이 아니라
+    실제 데이터와 통계로 확인할 수 있었다.
 
-    처음에는 전반전에서 앞서거나 뒤지는 상황이 최종 결과와
-    어떤 관계가 있을지 궁금했다. 데이터를 직접 정리하고
-    비율을 비교하면서 예상했던 경향을 수치로 확인할 수 있었다.
+    데이터를 정리하고 그래프로 표현하는 과정에서 경기 상황별
+    차이를 더 쉽게 이해할 수 있었다.
 
-    또한 로지스틱 회귀를 활용해 전반전 득점으로 최종 결과를
-    분류하는 과정도 경험했다.
+    또한 로지스틱 회귀를 이용해 최종 결과를 분류하고,
+    베이스라인과 비교하면서 머신러닝 모델의 성능을
+    객관적으로 평가하는 방법을 배웠다.
 
-    단순히 정확도만 보는 것이 아니라 정밀도, 재현율, F1 점수와
-    혼동 행렬을 함께 살펴봐야 모델의 성능을 더 정확하게
-    이해할 수 있다는 점을 배웠다.
+    앞으로는 더 많은 경기 데이터와 다양한 변수를 활용하면
+    분석 결과를 더 깊이 이해할 수 있을 것이라고 생각했다.
     """)
 
     st.divider()
 
     st.caption(
-        "자료 출처: 대한민국 축구 국가대표팀 경기 데이터 "
-        "(제공된 CSV 자료)"
+        "자료: 대한민국 축구 국가대표팀 경기 데이터"
     )
 
     st.caption(
-        "분석 방법: 전반전 상황별 비율 분석, 다중 로지스틱 회귀, "
-        "5겹 교차검증"
+        "분석 방법: 전반전 상황별 비율 분석, "
+        "다중 로지스틱 회귀, 베이스라인 비교, 5겹 교차검증"
     )
