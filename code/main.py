@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 
 from io import StringIO
 from urllib.parse import unquote
@@ -103,24 +105,19 @@ if missing_columns:
 def preprocess_data(data):
     df = data.copy()
 
-    # 숫자형으로 변환
     for col in SCORE_COLUMNS + ["연도"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 문자열 공백 정리
     for col in ["상대팀", "대회", "전반전상황", "최종결과"]:
         df[col] = df[col].astype("string").str.strip()
         df[col] = df[col].replace("", pd.NA)
 
-    # 분석에 필요한 열의 결측치 제거
     df = df.dropna(
         subset=FEATURES + ["최종결과", "전반전상황"]
     )
 
-    # 중복 행 제거
     df = df.drop_duplicates()
 
-    # 분석 대상 범주만 사용
     df = df[
         df["최종결과"].isin(RESULTS)
         & df["전반전상황"].isin(SITUATIONS)
@@ -139,7 +136,7 @@ if clean_df.empty:
 # ==========================================
 # 4. 모델 3개 선정
 # ==========================================
-def make_models():
+def make_models(k_value=5):
     return {
         "로지스틱 회귀": Pipeline([
             ("scaler", StandardScaler()),
@@ -153,7 +150,7 @@ def make_models():
 
         "k-최근접 이웃": Pipeline([
             ("scaler", StandardScaler()),
-            ("model", KNeighborsClassifier(n_neighbors=5))
+            ("model", KNeighborsClassifier(n_neighbors=k_value))
         ])
     }
 
@@ -162,7 +159,7 @@ def make_models():
 # 5. 모델 평가
 # ==========================================
 @st.cache_data
-def evaluate_models(data):
+def evaluate_models(data, k_value=5):
     X = data[FEATURES]
     y = data["최종결과"]
 
@@ -177,9 +174,8 @@ def evaluate_models(data):
         random_state=42
     )
 
-    models = make_models()
+    models = make_models(k_value)
 
-    # 베이스라인
     baseline = DummyClassifier(
         strategy="most_frequent"
     )
@@ -241,8 +237,7 @@ def evaluate_models(data):
 
     score_df = pd.DataFrame(scores)
 
-    # 전체 데이터로 최종 모델 학습
-    fitted_models = make_models()
+    fitted_models = make_models(k_value)
 
     for model in fitted_models.values():
         model.fit(X, y)
@@ -259,7 +254,20 @@ def evaluate_models(data):
     return score_df, prediction_df, fitted_models
 
 
-evaluation = evaluate_models(clean_df)
+# ==========================================
+# 6. K값 설정 및 모델 평가 실행
+# ==========================================
+max_k = max(1, min(15, int(len(clean_df) * 0.8) - 1))
+
+k_value = st.sidebar.slider(
+    "kNN의 K값(K)",
+    min_value=1,
+    max_value=max_k,
+    value=min(5, max_k),
+    help="가까운 과거 경기 몇 개를 참고할지 정합니다."
+)
+
+evaluation = evaluate_models(clean_df, k_value)
 
 if evaluation is None:
     st.error(
@@ -272,7 +280,7 @@ score_df, prediction_df, fitted_models = evaluation
 
 
 # ==========================================
-# 6. 공통 통계
+# 7. 공통 통계
 # ==========================================
 counts = pd.crosstab(
     clean_df["전반전상황"],
@@ -290,9 +298,10 @@ percentages = counts.div(
 
 
 # ==========================================
-# 7. 메뉴
+# 8. 메뉴
 # ==========================================
 st.title("⚽ 대한민국 축구 국가대표팀 경기 분석")
+
 st.caption(
     "전반전 경기 상황과 최종 결과의 관계를 데이터로 분석한다."
 )
@@ -306,6 +315,7 @@ menu = st.sidebar.radio(
         "모델 선정과 원리",
         "모델 학습 결과 비교",
         "전반전 상황별 최종 결과",
+        "모델 시각화 및 직접 예측",
         "경기 기록",
         "최종 보고서"
     ]
@@ -313,7 +323,7 @@ menu = st.sidebar.radio(
 
 
 # ==========================================
-# 8. 탐구 주제
+# 9. 탐구 주제
 # ==========================================
 if menu == "탐구 주제":
 
@@ -361,7 +371,7 @@ if menu == "탐구 주제":
 
 
 # ==========================================
-# 9. 데이터 살펴보기
+# 10. 데이터 살펴보기
 # ==========================================
 elif menu == "데이터 살펴보기":
 
@@ -430,7 +440,7 @@ elif menu == "데이터 살펴보기":
 
 
 # ==========================================
-# 10. 데이터 전처리
+# 11. 데이터 전처리
 # ==========================================
 elif menu == "데이터 전처리":
 
@@ -570,7 +580,7 @@ elif menu == "데이터 전처리":
 
 
 # ==========================================
-# 11. 모델 선정과 원리
+# 12. 모델 선정과 원리
 # ==========================================
 elif menu == "모델 선정과 원리":
 
@@ -628,21 +638,21 @@ elif menu == "모델 선정과 원리":
 
     st.subheader("모델 3. k-최근접 이웃(kNN)")
 
-    st.write("""
+    st.write(f"""
     kNN은 새로운 데이터와 가장 가까운 기존 데이터 k개를 찾고,
     그 이웃들의 다수결로 결과를 분류한다.
 
-    이번 분석에서는 k=5로 설정하여 가장 가까운 경기 5개의
+    현재 K값은 **{k_value}**이며, 가장 가까운 경기 {k_value}개의
     최종 결과를 참고한다.
 
     거리 계산에서 큰 숫자의 영향이 지나치게 커지지 않도록
-    StandardScaler로 득점 데이터를 정규화한다.
+    StandardScaler로 득점 데이터를 표준화한다.
     """)
 
     st.code(
         "새로운 경기의 전반전 득점 입력\n"
         "→ 기존 경기와 거리 계산\n"
-        "→ 가까운 5개 경기 선택\n"
+        "→ 가까운 경기 선택\n"
         "→ 다수결로 결과 분류",
         language="text"
     )
@@ -660,7 +670,7 @@ elif menu == "모델 선정과 원리":
 
 
 # ==========================================
-# 12. 모델 학습 결과 비교
+# 13. 모델 학습 결과 비교
 # ==========================================
 elif menu == "모델 학습 결과 비교":
 
@@ -817,7 +827,7 @@ elif menu == "모델 학습 결과 비교":
 
 
 # ==========================================
-# 13. 전반전 상황별 최종 결과
+# 14. 전반전 상황별 최종 결과
 # ==========================================
 elif menu == "전반전 상황별 최종 결과":
 
@@ -865,11 +875,245 @@ elif menu == "전반전 상황별 최종 결과":
 
 
 # ==========================================
-# 14. 경기 기록
+# 15. 모델 시각화 및 직접 예측
+# ==========================================
+elif menu == "모델 시각화 및 직접 예측":
+
+    st.header("⑦ 모델 시각화 및 직접 예측")
+
+    st.write(
+        "전반전 득점을 직접 입력해 최종 결과를 예측하고, "
+        "의사결정트리와 kNN이 데이터를 어떻게 판단하는지 살펴본다."
+    )
+
+    # --------------------------------------
+    # 의사결정트리 시각화
+    # --------------------------------------
+    st.subheader("1. 의사결정트리 시각화")
+
+    tree_model = fitted_models["의사결정트리"]
+
+    fig_tree, ax = plt.subplots(figsize=(18, 8))
+
+    plot_tree(
+        tree_model,
+        feature_names=FEATURES,
+        class_names=list(tree_model.classes_),
+        filled=True,
+        rounded=True,
+        proportion=False,
+        impurity=False,
+        fontsize=10,
+        ax=ax
+    )
+
+    ax.set_title("전반전 득점에 따른 최종 결과 분류")
+
+    st.pyplot(fig_tree, use_container_width=True)
+
+    plt.close(fig_tree)
+
+    st.caption(
+        "각 네모는 데이터가 나뉘는 지점이다. 조건을 따라 내려가면 "
+        "마지막 칸에서 예측 결과를 확인할 수 있다. "
+        "색은 해당 칸에서 가장 많이 나타난 최종 결과를 뜻한다."
+    )
+
+    st.divider()
+
+    # --------------------------------------
+    # 새로운 경기 예측
+    # --------------------------------------
+    st.subheader("2. 새로운 경기 결과 예측")
+
+    st.write("한국과 상대 팀의 전반전 득점을 입력해 보세요.")
+
+    input_col1, input_col2 = st.columns(2)
+
+    with input_col1:
+        korea_first = st.number_input(
+            "대한민국 전반전 득점",
+            min_value=0,
+            max_value=20,
+            value=1,
+            step=1
+        )
+
+    with input_col2:
+        opponent_first = st.number_input(
+            "상대 팀 전반전 득점",
+            min_value=0,
+            max_value=20,
+            value=0,
+            step=1
+        )
+
+    if st.button(
+        "두 모델로 경기 결과 예측하기",
+        type="primary"
+    ):
+
+        new_match = pd.DataFrame(
+            [[korea_first, opponent_first]],
+            columns=FEATURES
+        )
+
+        tree_prediction = fitted_models[
+            "의사결정트리"
+        ].predict(new_match)[0]
+
+        knn_prediction = fitted_models[
+            "k-최근접 이웃"
+        ].predict(new_match)[0]
+
+        result_col1, result_col2 = st.columns(2)
+
+        with result_col1:
+            st.metric(
+                "의사결정트리 예측",
+                tree_prediction
+            )
+
+        with result_col2:
+            st.metric(
+                f"kNN 예측 (K={k_value})",
+                knn_prediction
+            )
+
+        if tree_prediction == knn_prediction:
+
+            st.success(
+                "두 모델이 같은 결과를 예측했습니다."
+            )
+
+        else:
+
+            st.warning(
+                "두 모델의 예측이 다릅니다. 모델마다 판단 방식이 "
+                "다르기 때문이며, 예측을 실제 경기 결과로 "
+                "확정해서는 안 됩니다."
+            )
+
+        st.caption(
+            "이 예측은 현재 데이터 전체로 학습한 모델의 결과입니다. "
+            "실제 경기 결과를 보장하지 않으며, 입력한 경기는 학습 "
+            "데이터와 비슷한 조건이라는 가정 아래 분류됩니다."
+        )
+
+        st.divider()
+
+        # --------------------------------------
+        # kNN 가까운 경기 분석
+        # --------------------------------------
+        st.subheader("3. kNN이 참고한 가까운 과거 경기")
+
+        knn_pipeline = fitted_models["k-최근접 이웃"]
+
+        scaler = knn_pipeline.named_steps["scaler"]
+
+        query_scaled = scaler.transform(new_match)
+
+        all_scaled = scaler.transform(
+            clean_df[FEATURES]
+        )
+
+        distances = (
+            (all_scaled - query_scaled) ** 2
+        ).sum(axis=1) ** 0.5
+
+        neighbor_df = clean_df.copy()
+
+        neighbor_df["새 경기와의 거리"] = distances
+
+        neighbor_df = neighbor_df.sort_values(
+            "새 경기와의 거리"
+        ).head(k_value)
+
+        st.write(
+            f"새 경기와 가장 가까운 과거 경기 {k_value}개"
+        )
+
+        st.dataframe(
+            neighbor_df[
+                ["날짜", "상대팀"]
+                + FEATURES
+                + ["최종결과", "새 경기와의 거리"]
+            ].round(3),
+            use_container_width=True
+        )
+
+        vote_counts = (
+            neighbor_df["최종결과"]
+            .value_counts()
+            .reindex(RESULTS, fill_value=0)
+            .rename_axis("결과")
+            .reset_index(name="가까운 경기 수")
+        )
+
+        st.write("가까운 경기들의 결과 분포")
+
+        st.dataframe(
+            vote_counts,
+            use_container_width=True
+        )
+
+        # --------------------------------------
+        # kNN 산점도
+        # --------------------------------------
+        fig_neighbors = px.scatter(
+            clean_df,
+            x="한국_전반득점",
+            y="상대_전반득점",
+            color="최종결과",
+            hover_data=["날짜", "상대팀"],
+            title=f"전반전 득점이 비슷한 과거 경기 (K={k_value})"
+        )
+
+        fig_neighbors.add_trace(
+            go.Scatter(
+                x=neighbor_df["한국_전반득점"],
+                y=neighbor_df["상대_전반득점"],
+                mode="markers",
+                name="선택된 가까운 경기",
+                marker=dict(
+                    size=15,
+                    symbol="circle-open",
+                    line=dict(width=3)
+                )
+            )
+        )
+
+        fig_neighbors.add_trace(
+            go.Scatter(
+                x=[korea_first],
+                y=[opponent_first],
+                mode="markers",
+                name="새 경기",
+                marker=dict(
+                    size=18,
+                    symbol="star",
+                    color="black"
+                )
+            )
+        )
+
+        st.plotly_chart(
+            fig_neighbors,
+            use_container_width=True
+        )
+
+    st.info(
+        f"현재 kNN은 K={k_value}로 설정되어 있습니다. "
+        "왼쪽 메뉴의 K값 슬라이더를 바꾸면 모델 평가와 예측에 반영됩니다."
+    )
+
+
+# ==========================================
+# 16. 경기 기록
 # ==========================================
 elif menu == "경기 기록":
 
-    st.header("⑦ 경기 기록")
+    st.header("⑧ 경기 기록")
 
     selected = st.selectbox(
         "전반전 상황 선택",
@@ -892,11 +1136,11 @@ elif menu == "경기 기록":
 
 
 # ==========================================
-# 15. 최종 보고서
+# 17. 최종 보고서
 # ==========================================
 elif menu == "최종 보고서":
 
-    st.header("⑧ 최종 보고서")
+    st.header("⑨ 최종 보고서")
 
     st.subheader("1. 탐구 주제")
 
@@ -953,7 +1197,20 @@ elif menu == "최종 보고서":
         f"**{best_row['모델']}**이다."
     )
 
-    st.subheader("5. 결과를 믿기 어려운 이유")
+    st.subheader("5. 의사결정트리와 kNN 추가 분석")
+
+    st.write(f"""
+    의사결정트리 그래프를 통해 전반전 득점에 따라
+    데이터가 나뉘는 조건을 확인했다.
+
+    kNN에서는 K={k_value}로 설정하고, 새로운 경기와 가까운
+    과거 경기들의 결과를 비교해 다수결로 예측하도록 했다.
+
+    두 모델의 예측이 다를 수 있으므로 한 가지 모델의
+    결과만으로 경기 결과를 단정하지 않았다.
+    """)
+
+    st.subheader("6. 결과를 믿기 어려운 이유")
 
     st.write("""
     분석 데이터의 경기 수가 많지 않고, 전반전 득점 두 가지 변수만
@@ -964,7 +1221,7 @@ elif menu == "최종 보고서":
     모델 평가 결과를 신중하게 해석해야 한다.
     """)
 
-    st.subheader("6. 새롭게 알게 된 점")
+    st.subheader("7. 새롭게 알게 된 점")
 
     st.write("""
     같은 데이터라도 모델마다 작동 원리가 다르고
@@ -974,7 +1231,7 @@ elif menu == "최종 보고서":
     판단할 수 있다는 점을 배웠다.
     """)
 
-    st.subheader("7. 느낀 점")
+    st.subheader("8. 느낀 점")
 
     st.write("""
     이번 탐구를 통해 축구 경기의 흐름을 데이터로 분석하고,
