@@ -4,7 +4,6 @@ import pandas as pd
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 
 from io import StringIO
 from urllib.parse import unquote
@@ -12,7 +11,7 @@ from urllib.parse import unquote
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
@@ -77,6 +76,7 @@ def load_data():
                     )
                 except UnicodeDecodeError:
                     continue
+
         except Exception:
             continue
 
@@ -105,19 +105,24 @@ if missing_columns:
 def preprocess_data(data):
     df = data.copy()
 
+    # 숫자형으로 변환
     for col in SCORE_COLUMNS + ["연도"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # 문자열 공백 정리
     for col in ["상대팀", "대회", "전반전상황", "최종결과"]:
         df[col] = df[col].astype("string").str.strip()
         df[col] = df[col].replace("", pd.NA)
 
+    # 분석에 필요한 열의 결측치 제거
     df = df.dropna(
         subset=FEATURES + ["최종결과", "전반전상황"]
     )
 
+    # 중복 행 제거
     df = df.drop_duplicates()
 
+    # 분석 대상 범주만 사용
     df = df[
         df["최종결과"].isin(RESULTS)
         & df["전반전상황"].isin(SITUATIONS)
@@ -156,10 +161,231 @@ def make_models(k_value=5):
 
 
 # ==========================================
-# 5. 모델 평가
+# 5. 의사결정트리 Plotly 시각화 함수
+# ==========================================
+def draw_decision_tree_plotly(model):
+    """
+    학습된 의사결정트리를 Plotly로 시각화한다.
+    한국어 속성명과 실제 학습된 분기 기준을 표시한다.
+    """
+
+    tree = model.tree_
+
+    class_names = [
+        str(value) for value in model.classes_
+    ]
+
+    feature_names = {
+        0: "한국 전반전 득점",
+        1: "상대 팀 전반전 득점"
+    }
+
+    positions = {}
+    leaf_order = [0]
+
+    # 노드 위치 계산
+    def assign_positions(node, depth):
+
+        left_child = tree.children_left[node]
+        right_child = tree.children_right[node]
+
+        # 자식 노드가 없으면 리프 노드
+        if left_child == right_child:
+            x_pos = leaf_order[0]
+            leaf_order[0] += 1
+
+        else:
+            left_x = assign_positions(
+                left_child,
+                depth + 1
+            )
+
+            right_x = assign_positions(
+                right_child,
+                depth + 1
+            )
+
+            x_pos = (left_x + right_x) / 2
+
+        positions[node] = (x_pos, -depth)
+
+        return x_pos
+
+    assign_positions(0, 0)
+
+    fig = go.Figure()
+
+    # 노드 사이 연결선
+    for node in range(tree.node_count):
+
+        left_child = tree.children_left[node]
+        right_child = tree.children_right[node]
+
+        # 리프 노드는 연결선이 필요하지 않음
+        if left_child == right_child:
+            continue
+
+        x_parent, y_parent = positions[node]
+        x_left, y_left = positions[left_child]
+        x_right, y_right = positions[right_child]
+
+        # 왼쪽 가지: 조건을 만족하는 경우
+        fig.add_trace(go.Scatter(
+            x=[x_parent, x_left],
+            y=[y_parent, y_left],
+            mode="lines",
+            line=dict(
+                color="#2563EB",
+                width=2
+            ),
+            hoverinfo="skip",
+            showlegend=False
+        ))
+
+        # 오른쪽 가지: 조건을 만족하지 않는 경우
+        fig.add_trace(go.Scatter(
+            x=[x_parent, x_right],
+            y=[y_parent, y_right],
+            mode="lines",
+            line=dict(
+                color="#DC2626",
+                width=2
+            ),
+            hoverinfo="skip",
+            showlegend=False
+        ))
+
+        # 가지에 예 / 아니오 표시
+        fig.add_annotation(
+            x=(x_parent + x_left) / 2,
+            y=(y_parent + y_left) / 2,
+            text="예",
+            showarrow=False,
+            bgcolor="white",
+            font=dict(
+                size=11,
+                color="#2563EB"
+            )
+        )
+
+        fig.add_annotation(
+            x=(x_parent + x_right) / 2,
+            y=(y_parent + y_right) / 2,
+            text="아니오",
+            showarrow=False,
+            bgcolor="white",
+            font=dict(
+                size=11,
+                color="#DC2626"
+            )
+        )
+
+    # 노드별 설명 상자
+    for node in range(tree.node_count):
+
+        x_pos, y_pos = positions[node]
+
+        left_child = tree.children_left[node]
+        right_child = tree.children_right[node]
+
+        is_leaf = left_child == right_child
+
+        # 해당 노드에서 각 결과의 경기 수
+        class_counts = tree.value[node][0]
+
+        predicted_index = int(class_counts.argmax())
+        predicted_class = class_names[predicted_index]
+
+        sample_count = int(tree.n_node_samples[node])
+
+        if is_leaf:
+
+            label = (
+                f"최종 예측: {predicted_class}<br>"
+                f"해당 경기 수: {sample_count}"
+            )
+
+            background = "#DCFCE7"
+
+        else:
+
+            feature_index = int(tree.feature[node])
+
+            feature_label = feature_names.get(
+                feature_index,
+                str(feature_index)
+            )
+
+            threshold = tree.threshold[node]
+
+            label = (
+                f"{feature_label} ≤ {threshold:.1f}?<br>"
+                f"해당 경기 수: {sample_count}<br>"
+                f"현재 주요 결과: {predicted_class}"
+            )
+
+            background = "#DBEAFE"
+
+        fig.add_annotation(
+            x=x_pos,
+            y=y_pos,
+            text=label,
+            showarrow=False,
+            align="center",
+            bgcolor=background,
+            bordercolor="#64748B",
+            borderwidth=1,
+            borderpad=7,
+            font=dict(
+                family="Malgun Gothic, Apple SD Gothic Neo, Noto Sans CJK KR, sans-serif",
+                size=12,
+                color="#111827"
+            )
+        )
+
+    max_depth = int(tree.max_depth)
+    leaf_total = max(leaf_order[0], 1)
+
+    fig.update_layout(
+        title="전반전 득점으로 최종 경기 결과를 분류하는 의사결정트리",
+        showlegend=False,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=max(
+            520,
+            180 * (max_depth + 1)
+        ),
+        margin=dict(
+            l=30,
+            r=30,
+            t=80,
+            b=30
+        ),
+        font=dict(
+            family="Malgun Gothic, Apple SD Gothic Neo, Noto Sans CJK KR, sans-serif",
+            color="#111827"
+        ),
+        xaxis=dict(
+            visible=False,
+            range=[-1, leaf_total],
+            fixedrange=True
+        ),
+        yaxis=dict(
+            visible=False,
+            range=[-max_depth - 0.7, 0.7],
+            fixedrange=True
+        )
+    )
+
+    return fig
+
+
+# ==========================================
+# 6. 모델 평가
 # ==========================================
 @st.cache_data
 def evaluate_models(data, k_value=5):
+
     X = data[FEATURES]
     y = data["최종결과"]
 
@@ -176,6 +402,7 @@ def evaluate_models(data, k_value=5):
 
     models = make_models(k_value)
 
+    # 베이스라인 모델
     baseline = DummyClassifier(
         strategy="most_frequent"
     )
@@ -193,22 +420,33 @@ def evaluate_models(data, k_value=5):
 
     scores = [{
         "모델": "베이스라인",
-        "정확도": accuracy_score(y, baseline_predictions),
+        "정확도": accuracy_score(
+            y,
+            baseline_predictions
+        ),
         "정밀도": precision_score(
-            y, baseline_predictions,
-            average="macro", zero_division=0
+            y,
+            baseline_predictions,
+            average="macro",
+            zero_division=0
         ),
         "재현율": recall_score(
-            y, baseline_predictions,
-            average="macro", zero_division=0
+            y,
+            baseline_predictions,
+            average="macro",
+            zero_division=0
         ),
         "F1 점수": f1_score(
-            y, baseline_predictions,
-            average="macro", zero_division=0
+            y,
+            baseline_predictions,
+            average="macro",
+            zero_division=0
         )
     }]
 
+    # 세 모델 평가
     for name, model in models.items():
+
         pred = cross_val_predict(
             model,
             X,
@@ -222,28 +460,40 @@ def evaluate_models(data, k_value=5):
             "모델": name,
             "정확도": accuracy_score(y, pred),
             "정밀도": precision_score(
-                y, pred,
-                average="macro", zero_division=0
+                y,
+                pred,
+                average="macro",
+                zero_division=0
             ),
             "재현율": recall_score(
-                y, pred,
-                average="macro", zero_division=0
+                y,
+                pred,
+                average="macro",
+                zero_division=0
             ),
             "F1 점수": f1_score(
-                y, pred,
-                average="macro", zero_division=0
+                y,
+                pred,
+                average="macro",
+                zero_division=0
             )
         })
 
     score_df = pd.DataFrame(scores)
 
+    # 전체 데이터로 최종 모델 학습
     fitted_models = make_models(k_value)
 
     for model in fitted_models.values():
         model.fit(X, y)
 
     prediction_df = data[
-        ["날짜", "상대팀", "한국_전반득점", "상대_전반득점"]
+        [
+            "날짜",
+            "상대팀",
+            "한국_전반득점",
+            "상대_전반득점"
+        ]
     ].copy()
 
     prediction_df["실제 결과"] = y.values
@@ -255,19 +505,28 @@ def evaluate_models(data, k_value=5):
 
 
 # ==========================================
-# 6. K값 설정 및 모델 평가 실행
+# 7. KNN의 K값 설정
 # ==========================================
-max_k = max(1, min(15, int(len(clean_df) * 0.8) - 1))
+max_k = max(
+    1,
+    min(15, int(len(clean_df) * 0.8) - 1)
+)
 
 k_value = st.sidebar.slider(
     "kNN의 K값(K)",
     min_value=1,
     max_value=max_k,
     value=min(5, max_k),
-    help="가까운 과거 경기 몇 개를 참고할지 정합니다."
+    help=(
+        "가까운 과거 경기 몇 개를 참고할지 정합니다. "
+        "홀수를 사용하면 다수결 동률을 줄이는 데 도움이 됩니다."
+    )
 )
 
-evaluation = evaluate_models(clean_df, k_value)
+evaluation = evaluate_models(
+    clean_df,
+    k_value
+)
 
 if evaluation is None:
     st.error(
@@ -280,7 +539,7 @@ score_df, prediction_df, fitted_models = evaluation
 
 
 # ==========================================
-# 7. 공통 통계
+# 8. 공통 통계
 # ==========================================
 counts = pd.crosstab(
     clean_df["전반전상황"],
@@ -298,7 +557,7 @@ percentages = counts.div(
 
 
 # ==========================================
-# 8. 메뉴
+# 9. 메뉴
 # ==========================================
 st.title("⚽ 대한민국 축구 국가대표팀 경기 분석")
 
@@ -323,7 +582,7 @@ menu = st.sidebar.radio(
 
 
 # ==========================================
-# 9. 탐구 주제
+# 10. 탐구 주제
 # ==========================================
 if menu == "탐구 주제":
 
@@ -371,7 +630,7 @@ if menu == "탐구 주제":
 
 
 # ==========================================
-# 10. 데이터 살펴보기
+# 11. 데이터 살펴보기
 # ==========================================
 elif menu == "데이터 살펴보기":
 
@@ -420,7 +679,10 @@ elif menu == "데이터 살펴보기":
         ]
     })
 
-    st.dataframe(type_table, use_container_width=True)
+    st.dataframe(
+        type_table,
+        use_container_width=True
+    )
 
     st.subheader("결측치 확인")
 
@@ -432,7 +694,10 @@ elif menu == "데이터 살펴보기":
         ]
     })
 
-    st.dataframe(missing_df, use_container_width=True)
+    st.dataframe(
+        missing_df,
+        use_container_width=True
+    )
 
     st.write(
         f"전체 결측치 개수: **{int(original_df.isna().sum().sum())}개**"
@@ -440,7 +705,7 @@ elif menu == "데이터 살펴보기":
 
 
 # ==========================================
-# 11. 데이터 전처리
+# 12. 데이터 전처리
 # ==========================================
 elif menu == "데이터 전처리":
 
@@ -509,13 +774,19 @@ elif menu == "데이터 전처리":
         .reset_index()
     )
 
-    result_counts.columns = ["최종 결과", "경기 수"]
+    result_counts.columns = [
+        "최종 결과",
+        "경기 수"
+    ]
 
     result_counts["비율(%)"] = (
         result_counts["경기 수"] / len(clean_df) * 100
     ).round(1)
 
-    st.dataframe(result_counts, use_container_width=True)
+    st.dataframe(
+        result_counts,
+        use_container_width=True
+    )
 
     fig = px.bar(
         result_counts,
@@ -525,13 +796,17 @@ elif menu == "데이터 전처리":
         title="최종 결과별 경기 수"
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
 
     st.subheader("이상치 확인")
 
     outlier_rows = []
 
     for col in SCORE_COLUMNS:
+
         values = clean_df[col].dropna()
 
         q1 = values.quantile(0.25)
@@ -567,7 +842,10 @@ elif menu == "데이터 전처리":
 
     st.subheader("전처리된 데이터")
 
-    st.dataframe(clean_df, use_container_width=True)
+    st.dataframe(
+        clean_df,
+        use_container_width=True
+    )
 
     st.download_button(
         "전처리 데이터 다운로드",
@@ -580,7 +858,7 @@ elif menu == "데이터 전처리":
 
 
 # ==========================================
-# 12. 모델 선정과 원리
+# 13. 모델 선정과 원리
 # ==========================================
 elif menu == "모델 선정과 원리":
 
@@ -620,17 +898,24 @@ elif menu == "모델 선정과 원리":
     st.write("""
     의사결정트리는 여러 질문을 던지며 데이터를 나누는 모델이다.
 
-    예를 들어 한국의 전반전 득점이 상대보다 높은지,
-    같은지, 낮은지 등을 기준으로 분류한다.
+    이번 탐구에서는 한국의 전반전 득점과 상대 팀의 전반전 득점을
+    판단 기준으로 사용한다.
 
-    나무의 가지를 따라가면 어떤 조건으로 결과를 분류했는지
-    확인할 수 있다는 장점이 있다.
+    예를 들어 한국 전반전 득점이 특정 기준 이하인지,
+    상대 팀 전반전 득점이 특정 기준 이하인지 등을 판단한다.
+
+    각 질문에 따라 데이터를 나누고 마지막 단계에서
+    승리, 무승부, 패배 중 하나를 예측한다.
+
+    트리의 분기 기준은 임의로 만든 것이 아니라
+    실제 축구 경기 데이터로 학습하면서 찾아낸 값이다.
     """)
 
     st.code(
-        "전반전 득점 비교\n"
-        "→ 조건에 따라 데이터 분리\n"
-        "→ 승리 / 무승부 / 패배 분류",
+        "한국 전반전 득점 또는 상대 전반전 득점 확인\n"
+        "→ 조건에 따라 경기 데이터 분리\n"
+        "→ 다음 질문으로 이동\n"
+        "→ 승리 / 무승부 / 패배 예측",
         language="text"
     )
 
@@ -652,7 +937,7 @@ elif menu == "모델 선정과 원리":
     st.code(
         "새로운 경기의 전반전 득점 입력\n"
         "→ 기존 경기와 거리 계산\n"
-        "→ 가까운 경기 선택\n"
+        f"→ 가까운 {k_value}개 경기 선택\n"
         "→ 다수결로 결과 분류",
         language="text"
     )
@@ -670,7 +955,7 @@ elif menu == "모델 선정과 원리":
 
 
 # ==========================================
-# 13. 모델 학습 결과 비교
+# 14. 모델 학습 결과 비교
 # ==========================================
 elif menu == "모델 학습 결과 비교":
 
@@ -685,7 +970,12 @@ elif menu == "모델 학습 결과 비교":
 
     display_scores = score_df.copy()
 
-    for col in ["정확도", "정밀도", "재현율", "F1 점수"]:
+    for col in [
+        "정확도",
+        "정밀도",
+        "재현율",
+        "F1 점수"
+    ]:
         display_scores[col] = (
             display_scores[col] * 100
         ).round(1)
@@ -763,8 +1053,10 @@ elif menu == "모델 학습 결과 비교":
 
     if difference > 0:
         st.success("해당 모델의 정확도가 베이스라인보다 높다.")
+
     elif difference < 0:
         st.warning("해당 모델의 정확도가 베이스라인보다 낮다.")
+
     else:
         st.info("해당 모델과 베이스라인의 정확도가 같다.")
 
@@ -774,7 +1066,11 @@ elif menu == "모델 학습 결과 비교":
 
     selected_model = st.selectbox(
         "확인할 모델",
-        ["로지스틱 회귀", "의사결정트리", "k-최근접 이웃"]
+        [
+            "로지스틱 회귀",
+            "의사결정트리",
+            "k-최근접 이웃"
+        ]
     )
 
     cm = confusion_matrix(
@@ -797,7 +1093,10 @@ elif menu == "모델 학습 결과 비교":
         title=f"{selected_model} 혼동 행렬"
     )
 
-    st.plotly_chart(fig_cm, use_container_width=True)
+    st.plotly_chart(
+        fig_cm,
+        use_container_width=True
+    )
 
     st.write("""
     혼동 행렬에서 행은 실제 결과이고 열은 모델의 예측 결과이다.
@@ -821,13 +1120,13 @@ elif menu == "모델 학습 결과 비교":
     )
 
     st.warning("""
-    경기 수가 70개 정도로 많지 않기 때문에 결과를 일반화하기 어렵다.
+    경기 수가 많지 않기 때문에 결과를 일반화하기 어렵다.
     모델 점수가 높더라도 모든 경기에서 정확하게 예측한다고 볼 수 없다.
     """)
 
 
 # ==========================================
-# 14. 전반전 상황별 최종 결과
+# 15. 전반전 상황별 최종 결과
 # ==========================================
 elif menu == "전반전 상황별 최종 결과":
 
@@ -863,7 +1162,10 @@ elif menu == "전반전 상황별 최종 결과":
         title="전반전 상황별 최종 결과 비율"
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
 
     st.write("""
     전반전에 앞선 경기, 동점인 경기, 뒤진 경기에서
@@ -875,7 +1177,7 @@ elif menu == "전반전 상황별 최종 결과":
 
 
 # ==========================================
-# 15. 모델 시각화 및 직접 예측
+# 16. 모델 시각화 및 직접 예측
 # ==========================================
 elif menu == "모델 시각화 및 직접 예측":
 
@@ -891,42 +1193,49 @@ elif menu == "모델 시각화 및 직접 예측":
     # --------------------------------------
     st.subheader("1. 의사결정트리 시각화")
 
+    st.write("""
+    한국 전반전 득점과 상대 팀 전반전 득점을 질문의 기준으로 삼아
+    최종 결과인 승리·무승부·패배를 분류한다.
+
+    아래 분기 숫자는 임의로 정한 값이 아니라
+    실제 축구 경기 데이터로 학습한 트리가 찾아낸 기준이다.
+    """)
+
     tree_model = fitted_models["의사결정트리"]
 
-    fig_tree, ax = plt.subplots(figsize=(18, 8))
-
-    plot_tree(
-        tree_model,
-        feature_names=FEATURES,
-        class_names=list(tree_model.classes_),
-        filled=True,
-        rounded=True,
-        proportion=False,
-        impurity=False,
-        fontsize=10,
-        ax=ax
+    fig_tree = draw_decision_tree_plotly(
+        tree_model
     )
 
-    ax.set_title("전반전 득점에 따른 최종 결과 분류")
-
-    st.pyplot(fig_tree, use_container_width=True)
-
-    plt.close(fig_tree)
+    st.plotly_chart(
+        fig_tree,
+        use_container_width=True
+    )
 
     st.caption(
-        "각 네모는 데이터가 나뉘는 지점이다. 조건을 따라 내려가면 "
-        "마지막 칸에서 예측 결과를 확인할 수 있다. "
-        "색은 해당 칸에서 가장 많이 나타난 최종 결과를 뜻한다."
+        "파란색 상자는 전반전 득점에 관한 판단 조건이고, "
+        "초록색 상자는 마지막 예측 결과이다. "
+        "파란색 '예' 선은 조건을 만족하는 경우, "
+        "빨간색 '아니오' 선은 조건을 만족하지 않는 경우이다. "
+        "분기 기준과 경기 수는 실제 학습 데이터에서 계산했다."
     )
+
+    st.info("""
+    의사결정트리는 전반전 득점만으로 최종 결과를 예측한다.
+    상대 팀의 실력, 경기 장소, 선수 구성 등의 정보는 사용하지 않으므로
+    실제 경기 결과를 확정적으로 예측하는 도구는 아니다.
+    """)
 
     st.divider()
 
     # --------------------------------------
-    # 새로운 경기 예측
+    # 새로운 경기 직접 예측
     # --------------------------------------
     st.subheader("2. 새로운 경기 결과 예측")
 
-    st.write("한국과 상대 팀의 전반전 득점을 입력해 보세요.")
+    st.write(
+        "한국과 상대 팀의 전반전 득점을 입력해 보세요."
+    )
 
     input_col1, input_col2 = st.columns(2)
 
@@ -989,22 +1298,21 @@ elif menu == "모델 시각화 및 직접 예측":
         else:
 
             st.warning(
-                "두 모델의 예측이 다릅니다. 모델마다 판단 방식이 "
-                "다르기 때문이며, 예측을 실제 경기 결과로 "
-                "확정해서는 안 됩니다."
+                "두 모델의 예측이 다릅니다. 모델마다 판단 방식이 다르기 때문이며, "
+                "예측을 실제 경기 결과로 확정해서는 안 됩니다."
             )
 
         st.caption(
             "이 예측은 현재 데이터 전체로 학습한 모델의 결과입니다. "
-            "실제 경기 결과를 보장하지 않으며, 입력한 경기는 학습 "
-            "데이터와 비슷한 조건이라는 가정 아래 분류됩니다."
+            "실제 경기 결과를 보장하지 않으며, 입력한 경기는 "
+            "학습 데이터와 비슷한 조건이라는 가정 아래 분류됩니다."
         )
 
         st.divider()
 
-        # --------------------------------------
-        # kNN 가까운 경기 분석
-        # --------------------------------------
+        # ----------------------------------
+        # kNN이 참고한 가까운 경기
+        # ----------------------------------
         st.subheader("3. kNN이 참고한 가까운 과거 경기")
 
         knn_pipeline = fitted_models["k-최근접 이웃"]
@@ -1029,15 +1337,15 @@ elif menu == "모델 시각화 및 직접 예측":
             "새 경기와의 거리"
         ).head(k_value)
 
-        st.write(
-            f"새 경기와 가장 가까운 과거 경기 {k_value}개"
-        )
-
         st.dataframe(
             neighbor_df[
-                ["날짜", "상대팀"]
-                + FEATURES
-                + ["최종결과", "새 경기와의 거리"]
+                [
+                    "날짜",
+                    "상대팀"
+                ] + FEATURES + [
+                    "최종결과",
+                    "새 경기와의 거리"
+                ]
             ].round(3),
             use_container_width=True
         )
@@ -1057,16 +1365,21 @@ elif menu == "모델 시각화 및 직접 예측":
             use_container_width=True
         )
 
-        # --------------------------------------
-        # kNN 산점도
-        # --------------------------------------
+        # ----------------------------------
+        # 가까운 경기 산점도
+        # ----------------------------------
         fig_neighbors = px.scatter(
             clean_df,
             x="한국_전반득점",
             y="상대_전반득점",
             color="최종결과",
             hover_data=["날짜", "상대팀"],
-            title=f"전반전 득점이 비슷한 과거 경기 (K={k_value})"
+            title=f"전반전 득점이 비슷한 과거 경기 (K={k_value})",
+            labels={
+                "한국_전반득점": "한국 전반전 득점",
+                "상대_전반득점": "상대 팀 전반전 득점",
+                "최종결과": "최종 결과"
+            }
         )
 
         fig_neighbors.add_trace(
@@ -1109,7 +1422,7 @@ elif menu == "모델 시각화 및 직접 예측":
 
 
 # ==========================================
-# 16. 경기 기록
+# 17. 경기 기록
 # ==========================================
 elif menu == "경기 기록":
 
@@ -1127,7 +1440,9 @@ elif menu == "경기 기록":
             filtered["전반전상황"] == selected
         ]
 
-    st.write(f"검색된 경기: {len(filtered)}경기")
+    st.write(
+        f"검색된 경기: {len(filtered)}경기"
+    )
 
     st.dataframe(
         filtered[REQUIRED_COLUMNS],
@@ -1136,7 +1451,7 @@ elif menu == "경기 기록":
 
 
 # ==========================================
-# 17. 최종 보고서
+# 18. 최종 보고서
 # ==========================================
 elif menu == "최종 보고서":
 
@@ -1175,7 +1490,12 @@ elif menu == "최종 보고서":
 
     report_scores = score_df.copy()
 
-    for col in ["정확도", "정밀도", "재현율", "F1 점수"]:
+    for col in [
+        "정확도",
+        "정밀도",
+        "재현율",
+        "F1 점수"
+    ]:
         report_scores[col] = (
             report_scores[col] * 100
         ).round(1)
@@ -1203,11 +1523,12 @@ elif menu == "최종 보고서":
     의사결정트리 그래프를 통해 전반전 득점에 따라
     데이터가 나뉘는 조건을 확인했다.
 
-    kNN에서는 K={k_value}로 설정하고, 새로운 경기와 가까운
-    과거 경기들의 결과를 비교해 다수결로 예측하도록 했다.
+    kNN에서는 K={k_value}로 설정하고,
+    새로운 경기와 가까운 과거 경기들의 결과를 비교해
+    다수결로 예측하도록 했다.
 
-    두 모델의 예측이 다를 수 있으므로 한 가지 모델의
-    결과만으로 경기 결과를 단정하지 않았다.
+    두 모델의 예측이 다를 수 있으므로
+    한 가지 모델의 결과만으로 경기 결과를 단정하지 않았다.
     """)
 
     st.subheader("6. 결과를 믿기 어려운 이유")
