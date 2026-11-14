@@ -1,8 +1,9 @@
+
 import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
-import plotly.graph_objects as go
+import numpy as np
 
 from io import StringIO
 from urllib.parse import unquote
@@ -10,8 +11,7 @@ from urllib.parse import unquote
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.multiclass import OneVsRestClassifier
 from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import (
@@ -21,6 +21,7 @@ from sklearn.metrics import (
     f1_score,
     confusion_matrix,
 )
+
 
 # =========================================================
 # 1. 기본 설정
@@ -41,7 +42,9 @@ DATA_URL = (
 )
 
 FEATURES = ["한국_전반득점", "상대_전반득점"]
+
 RESULTS = ["승리", "무승부", "패배"]
+
 SITUATIONS = ["앞섬", "동점", "뒤짐"]
 
 SCORE_COLUMNS = [
@@ -52,10 +55,16 @@ SCORE_COLUMNS = [
 ]
 
 REQUIRED_COLUMNS = [
-    "날짜", "연도", "상대팀", "대회",
-    "한국_전반득점", "상대_전반득점",
-    "한국_최종득점", "상대_최종득점",
-    "전반전상황", "최종결과",
+    "날짜",
+    "연도",
+    "상대팀",
+    "대회",
+    "한국_전반득점",
+    "상대_전반득점",
+    "한국_최종득점",
+    "상대_최종득점",
+    "전반전상황",
+    "최종결과",
 ]
 
 FONT = "Malgun Gothic, Apple SD Gothic Neo, Noto Sans CJK KR, sans-serif"
@@ -115,11 +124,11 @@ def preprocess_data(data):
 
     df = data.copy()
 
-    # 숫자형으로 변환
+    # 득점과 연도를 숫자형으로 변환
     for col in SCORE_COLUMNS + ["연도"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 문자열 공백 제거
+    # 문자열의 앞뒤 공백 제거
     for col in ["상대팀", "대회", "전반전상황", "최종결과"]:
         df[col] = df[col].astype("string").str.strip()
         df[col] = df[col].replace("", pd.NA)
@@ -129,7 +138,7 @@ def preprocess_data(data):
         subset=FEATURES + ["최종결과", "전반전상황"]
     )
 
-    # 중복 제거
+    # 중복 데이터 제거
     df = df.drop_duplicates()
 
     # 분석에 필요한 범주만 사용
@@ -148,7 +157,7 @@ if clean_df.empty:
     st.stop()
 
 
-# 5겹 교차검증을 위해 각 결과가 최소 5개 필요
+# 5겹 교차검증을 위해 각 결과에 최소 5개 데이터 필요
 class_counts = clean_df["최종결과"].value_counts().reindex(
     RESULTS,
     fill_value=0
@@ -163,26 +172,28 @@ if class_counts.min() < 5:
 # 4. 모델 만들기
 # =========================================================
 
-# 로지스틱 회귀
+# One-vs-Rest 로지스틱 회귀
+#
+# 승리 모델: 승리(1) vs 무승부·패배(0)
+# 무승부 모델: 무승부(1) vs 승리·패배(0)
+# 패배 모델: 패배(1) vs 승리·무승부(0)
+#
+# 각각의 모델이 시그모이드 함수를 이용해
+# 해당 결과에 속할 확률을 계산한다.
+
 def make_logistic_model():
 
     return Pipeline([
         ("scaler", StandardScaler()),
-        ("model", LogisticRegression(max_iter=3000)),
-    ])
 
-
-# k-최근접 이웃
-def make_knn_model():
-
-    return Pipeline([
-        ("scaler", StandardScaler()),
-        ("model", KNeighborsClassifier(n_neighbors=5)),
+        ("model", OneVsRestClassifier(
+            LogisticRegression(max_iter=3000)
+        )),
     ])
 
 
 # =========================================================
-# 5. 세 가지 모델 성능 비교
+# 5. 기준선과 로지스틱 회귀 성능 비교
 # =========================================================
 
 @st.cache_data
@@ -191,6 +202,7 @@ def evaluate_models(data):
     X = data[FEATURES]
     y = data["최종결과"]
 
+    # 5겹 층화 교차검증
     cv = StratifiedKFold(
         n_splits=5,
         shuffle=True,
@@ -202,14 +214,7 @@ def evaluate_models(data):
             strategy="most_frequent"
         ),
 
-        "로지스틱 회귀": make_logistic_model(),
-
-        "의사결정트리": DecisionTreeClassifier(
-            max_depth=3,
-            random_state=42,
-        ),
-
-        "k-최근접 이웃": make_knn_model(),
+        "One-vs-Rest 로지스틱 회귀": make_logistic_model(),
     }
 
     rows = []
@@ -232,19 +237,22 @@ def evaluate_models(data):
             "정확도": accuracy_score(y, pred),
 
             "정밀도": precision_score(
-                y, pred,
+                y,
+                pred,
                 average="macro",
                 zero_division=0,
             ),
 
             "재현율": recall_score(
-                y, pred,
+                y,
+                pred,
                 average="macro",
                 zero_division=0,
             ),
 
             "F1 점수": f1_score(
-                y, pred,
+                y,
+                pred,
                 average="macro",
                 zero_division=0,
             ),
@@ -252,11 +260,11 @@ def evaluate_models(data):
 
     score_df = pd.DataFrame(rows)
 
-    # 최종 분석 모델은 로지스틱 회귀
+    # 전체 데이터를 이용해 최종 로지스틱 회귀 모델 학습
     final_model = make_logistic_model()
     final_model.fit(X, y)
 
-    # 실제 결과와 로지스틱 회귀 예측 결과
+    # 교차검증에서 얻은 예측 결과 저장
     prediction_df = data[
         ["날짜", "상대팀"] + FEATURES
     ].copy()
@@ -264,7 +272,7 @@ def evaluate_models(data):
     prediction_df["실제 결과"] = y.values
 
     prediction_df["로지스틱 회귀 예측"] = (
-        predictions["로지스틱 회귀"]
+        predictions["One-vs-Rest 로지스틱 회귀"]
     )
 
     return score_df, prediction_df, final_model
@@ -277,6 +285,7 @@ score_df, prediction_df, final_model = evaluate_models(clean_df)
 # 6. 공통 통계
 # =========================================================
 
+# 전반전 상황별 최종 결과 경기 수
 counts = pd.crosstab(
     clean_df["전반전상황"],
     clean_df["최종결과"],
@@ -286,12 +295,14 @@ counts = pd.crosstab(
     fill_value=0,
 )
 
+# 전반전 상황별 최종 결과 비율
 percentages = counts.div(
     counts.sum(axis=1).replace(0, 1),
     axis=0,
 ) * 100
 
 
+# 최종 결과별 경기 수
 result_counts = (
     clean_df["최종결과"]
     .value_counts()
@@ -305,6 +316,7 @@ result_counts["비율(%)"] = (
 ).round(1)
 
 
+# 평가 점수를 백분율로 변환
 display_scores = score_df.copy()
 
 for col in ["정확도", "정밀도", "재현율", "F1 점수"]:
@@ -321,7 +333,8 @@ st.title("⚽ 대한민국 축구 국가대표팀 경기 분석")
 
 st.caption(
     "전반전 득점을 바탕으로 최종 경기 결과를 분석하고 "
-    "로지스틱 회귀로 승리·무승부·패배를 예측한다."
+    "시그모이드 기반 One-vs-Rest 로지스틱 회귀로 "
+    "승리·무승부·패배를 예측한다."
 )
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -361,8 +374,9 @@ with tab1:
     st.markdown("""
     1. 전반전 상황별 최종 결과 비율을 비교한다.
     2. 한국과 상대 팀의 전반전 득점을 입력 변수로 사용한다.
-    3. 세 가지 분류 모델의 성능을 비교한다.
-    4. 로지스틱 회귀를 최종 모델로 선정해 심층 분석한다.
+    3. 기준선과 One-vs-Rest 로지스틱 회귀의 성능을 비교한다.
+    4. 시그모이드 함수와 세 가지 이진 분류 과정을 이해한다.
+    5. 로지스틱 회귀의 예측 확률과 계수를 심층 분석한다.
     """)
 
     st.divider()
@@ -388,11 +402,12 @@ with tab1:
     st.subheader("최종 탐구 방향")
 
     st.info("""
-    먼저 로지스틱 회귀, 의사결정트리, k-최근접 이웃의
-    성능을 비교한다.
+    가장 많이 등장한 결과만 예측하는 기준선과
+    One-vs-Rest 로지스틱 회귀의 성능을 비교한다.
 
-    이후 성능과 해석 가능성을 고려해 로지스틱 회귀를
-    최종 모델로 선정하고, 예측 확률과 계수 등을 분석한다.
+    로지스틱 회귀는 승리·무승부·패배를 각각
+    '해당 결과 vs 나머지 결과'로 나누어 시그모이드 함수로 분류한다.
+    이후 예측 확률과 계수를 분석한다.
     """)
 
 
@@ -655,12 +670,12 @@ with tab3:
 
 
 # =========================================================
-# TAB 4. 모델 비교 및 로지스틱 회귀 분석
+# TAB 4. 기준선 비교 및 시그모이드 로지스틱 회귀
 # =========================================================
 
 with tab4:
 
-    st.header("4. 모델 비교 및 로지스틱 회귀 분석")
+    st.header("4. 기준선 비교 및 시그모이드 로지스틱 회귀 분석")
 
     st.subheader("분석에 사용한 변수")
 
@@ -683,14 +698,11 @@ with tab4:
     # 1단계: 모델 성능 비교
     # -----------------------------------------------------
 
-    st.subheader("① 세 가지 모델 성능 비교")
+    st.subheader("① 기준선과 로지스틱 회귀 성능 비교")
 
     st.write("""
-    로지스틱 회귀, 의사결정트리, k-최근접 이웃의
-    성능을 같은 5겹 교차검증 방식으로 비교했다.
-
-    베이스라인은 가장 많이 등장하는 결과만 예측하는
-    기준 모델로 사용했다.
+    가장 많이 등장하는 결과만 예측하는 기준선과
+    One-vs-Rest 로지스틱 회귀를 같은 5겹 교차검증 방식으로 비교했다.
     """)
 
     st.dataframe(
@@ -709,14 +721,12 @@ with tab4:
         y=metric_choice,
         color="모델",
         text=metric_choice,
-        title=f"모델별 {metric_choice} 비교",
+        title=f"기준선과 로지스틱 회귀의 {metric_choice} 비교",
         range_y=[0, 100],
         category_orders={
             "모델": [
                 "베이스라인",
-                "로지스틱 회귀",
-                "의사결정트리",
-                "k-최근접 이웃",
+                "One-vs-Rest 로지스틱 회귀",
             ]
         },
     )
@@ -745,7 +755,7 @@ with tab4:
         y="점수(%)",
         color="평가 지표",
         barmode="group",
-        title="모델별 네 가지 평가 지표 비교",
+        title="기준선과 로지스틱 회귀의 네 가지 평가 지표 비교",
         range_y=[0, 100],
     )
 
@@ -757,44 +767,92 @@ with tab4:
     )
 
     st.caption("""
-    해석: 정확도는 전체 예측 중 맞힌 비율,
-    정밀도는 특정 결과라고 예측한 것 중 실제로 맞힌 비율,
-    재현율은 실제 특정 결과 중 찾아낸 비율이다.
+    정확도는 전체 예측 중 맞힌 비율이다.
+    정밀도는 특정 결과라고 예측한 것 중 실제로 맞힌 비율이다.
+    재현율은 실제 특정 결과 중 모델이 찾아낸 비율이다.
     F1 점수는 정밀도와 재현율을 함께 고려한 지표이다.
     """)
 
     st.divider()
 
     # -----------------------------------------------------
-    # 2단계: 로지스틱 회귀 선택 이유
+    # 2단계: 시그모이드 함수 설명
     # -----------------------------------------------------
 
-    st.subheader("② 로지스틱 회귀를 최종 모델로 선택한 이유")
+    st.subheader("② 시그모이드 함수와 One-vs-Rest 방식")
+
+    st.write("""
+    기본적인 이진 로지스틱 회귀는 회귀식의 결과값 z를
+    시그모이드 함수에 넣어 0과 1 사이의 확률로 바꾼다.
+
+    이번 탐구의 최종 결과는 승리·무승부·패배 세 가지이므로,
+    One-vs-Rest 방식을 사용한다.
+    이 방식은 세 가지 결과를 각각 하나의 이진 분류 문제로 나누어 학습한다.
+    """)
 
     st.markdown("""
-    **1. 분류 문제에 적합하다.**
+    - 승리 모델: 승리(1) vs 무승부·패배(0)
+    - 무승부 모델: 무승부(1) vs 승리·패배(0)
+    - 패배 모델: 패배(1) vs 승리·무승부(0)
+    """)
 
-    최종 결과가 승리·무승부·패배라는 세 가지 범주이므로
-    로지스틱 회귀를 이용한 다중 분류가 가능하다.
+    st.latex(r"\sigma(z)=\frac{1}{1+e^{-z}}")
 
-    **2. 결과별 예측 확률을 확인할 수 있다.**
+    # 시그모이드 그래프 데이터 생성
+    sigmoid_x = np.linspace(-8, 8, 300)
 
-    승리, 무승부, 패배가 각각 나올 확률을 비교할 수 있어
-    모델의 예측 과정을 설명하기 쉽다.
+    sigmoid_y = 1 / (1 + np.exp(-sigmoid_x))
 
-    **3. 계수를 통해 입력 변수의 영향을 해석할 수 있다.**
+    sigmoid_df = pd.DataFrame({
+        "z": sigmoid_x,
+        "시그모이드 확률": sigmoid_y,
+    })
 
-    한국과 상대 팀의 전반전 득점이
-    각 결과의 모델 판단과 어떤 방향으로 관련되는지 살펴볼 수 있다.
+    fig_sigmoid = px.line(
+        sigmoid_df,
+        x="z",
+        y="시그모이드 확률",
+        title="시그모이드 함수: 입력값을 0~1 사이 확률로 변환",
+    )
 
-    **4. 구조가 비교적 단순하다.**
+    fig_sigmoid.add_hline(
+        y=0.5,
+        line_dash="dash",
+        line_color="gray",
+        annotation_text="분류 기준 예시: 0.5",
+    )
 
-    모델의 원리와 분석 결과를 포스터 발표에서
-    이해하기 쉽게 설명할 수 있다.
+    fig_sigmoid.update_layout(
+        yaxis_range=[0, 1],
+        xaxis_title="회귀식의 결과값 z",
+        yaxis_title="확률",
+        font_family=FONT,
+    )
+
+    st.plotly_chart(
+        fig_sigmoid,
+        use_container_width=True,
+    )
+
+    st.caption("""
+    시그모이드 함수는 입력값을 0과 1 사이의 확률로 변환한다.
+    0.5는 하나의 이진 분류에서 사용하는 기본 분류 기준 예시이다.
+    세 가지 결과를 예측할 때는 각 이진 모델의 확률을 비교해
+    가장 높은 결과를 최종 예측으로 선택한다.
+    """)
+
+    st.markdown("""
+    **로지스틱 회귀를 선택한 이유**
+
+    1. 시그모이드 함수를 이용해 이진 결과의 확률을 계산한다.
+    2. One-vs-Rest 방식으로 승리·무승부·패배 세 범주에 적용할 수 있다.
+    3. 각 결과에 대한 예측 확률을 확인할 수 있다.
+    4. 계수를 통해 전반전 득점과 각 결과의 관계를 해석할 수 있다.
+    5. 기준선과 같은 교차검증 및 평가 지표로 성능을 비교할 수 있다.
     """)
 
     logistic_row = score_df[
-        score_df["모델"] == "로지스틱 회귀"
+        score_df["모델"] == "One-vs-Rest 로지스틱 회귀"
     ].iloc[0]
 
     best_f1_row = score_df.loc[
@@ -806,30 +864,29 @@ with tab4:
     ]
 
     st.write(
-        f"로지스틱 회귀의 정확도는 "
+        f"One-vs-Rest 로지스틱 회귀의 정확도는 "
         f"**{logistic_row['정확도'] * 100:.1f}%**, "
         f"매크로 F1 점수는 "
         f"**{logistic_row['F1 점수'] * 100:.1f}%**이다."
     )
 
-    if best_f1_row["모델"] == "로지스틱 회귀":
+    if best_f1_row["모델"] == "One-vs-Rest 로지스틱 회귀":
 
         st.success(
-            "로지스틱 회귀는 비교 모델 중 매크로 F1 점수가 "
-            "가장 높았다. 세 가지 결과를 균형 있게 구분하는 "
-            "성능을 근거로 최종 모델로 선정했다."
+            "로지스틱 회귀는 기준선보다 매크로 F1 점수가 높았다. "
+            "세 가지 결과를 기준선보다 균형 있게 구분했다."
         )
 
     else:
 
         st.warning(
-            f"매크로 F1 점수는 {best_f1_row['모델']}이 가장 높다. "
-            "따라서 로지스틱 회귀가 모든 지표에서 가장 우수하다고 "
-            "주장하지 않고, 확률 예측과 계수 해석의 장점을 "
-            "최종 모델 선정 근거로 제시한다."
+            f"매크로 F1 점수는 {best_f1_row['모델']}이 더 높다. "
+            "따라서 로지스틱 회귀가 모든 지표에서 더 우수하다고 "
+            "주장하지 않고, 시그모이드 기반 확률 예측과 계수 해석의 "
+            "장점을 최종 모델 선정 근거로 제시한다."
         )
 
-    if best_accuracy_row["모델"] != "로지스틱 회귀":
+    if best_accuracy_row["모델"] != "One-vs-Rest 로지스틱 회귀":
 
         st.caption(
             f"참고: 정확도는 {best_accuracy_row['모델']}이 가장 높다. "
@@ -842,12 +899,10 @@ with tab4:
     # 3단계: 로지스틱 회귀 심층 분석
     # -----------------------------------------------------
 
-    st.subheader("③ 로지스틱 회귀 심층 분석")
+    st.subheader("③ One-vs-Rest 로지스틱 회귀 심층 분석")
 
     st.write("""
-    세 가지 모델을 비교한 후 로지스틱 회귀를 최종 분석 모델로 선정했다.
-
-    이제 로지스틱 회귀의 혼동 행렬과 계수,
+    기준선과 비교한 로지스틱 회귀의 혼동 행렬과 계수,
     새로운 경기의 예측 확률을 살펴본다.
     """)
 
@@ -871,7 +926,7 @@ with tab4:
         text_auto=True,
         aspect="auto",
         color_continuous_scale="Blues",
-        title="로지스틱 회귀 혼동 행렬",
+        title="One-vs-Rest 로지스틱 회귀 혼동 행렬",
     )
 
     fig_cm.update_layout(font_family=FONT)
@@ -890,29 +945,33 @@ with tab4:
 
     st.divider()
 
-    # 계수 그래프
+    # -----------------------------------------------------
+    # 4단계: 로지스틱 회귀 계수 분석
+    # -----------------------------------------------------
+
     st.subheader("로지스틱 회귀 계수 그래프")
 
-    fitted_logistic = final_model.named_steps["model"]
+    fitted_ovr = final_model.named_steps["model"]
 
-    coefficient_df = pd.DataFrame(
-        fitted_logistic.coef_,
-        columns=[
-            "한국 전반전 득점",
-            "상대 전반전 득점",
-        ],
-        index=fitted_logistic.classes_,
-    )
+    coefficient_rows = []
 
-    coefficient_long = (
-        coefficient_df
-        .rename_axis("결과")
-        .reset_index()
-        .melt(
-            id_vars="결과",
-            var_name="입력 변수",
-            value_name="계수",
-        )
+    for result_name, binary_model in zip(
+        fitted_ovr.classes_,
+        fitted_ovr.estimators_,
+    ):
+
+        coefficient_rows.append({
+            "결과": result_name,
+            "한국 전반전 득점": binary_model.coef_[0][0],
+            "상대 전반전 득점": binary_model.coef_[0][1],
+        })
+
+    coefficient_df = pd.DataFrame(coefficient_rows)
+
+    coefficient_long = coefficient_df.melt(
+        id_vars="결과",
+        var_name="입력 변수",
+        value_name="계수",
     )
 
     fig_coef = px.bar(
@@ -921,7 +980,7 @@ with tab4:
         y="계수",
         color="결과",
         barmode="group",
-        title="결과별 로지스틱 회귀 계수",
+        title="결과별 이진 로지스틱 회귀 계수",
     )
 
     fig_coef.add_hline(
@@ -938,19 +997,22 @@ with tab4:
     )
 
     st.write("""
-    계수는 표준화된 전반전 득점이 각 결과의 모델 점수에
+    각 결과별 이진 로지스틱 회귀 모델에서 계수는
+    표준화된 전반전 득점이 해당 결과의 로그 오즈에
     어떤 방향으로 관련되는지 보여 준다.
 
-    양수 계수는 해당 결과의 상대적인 점수를 높이는 방향,
+    양수 계수는 해당 결과의 로그 오즈를 높이는 방향,
     음수 계수는 낮추는 방향으로 작용한다.
 
-    다만 계수만으로 실제 경기 결과의 원인이라고
-    단정할 수는 없다.
+    계수만으로 실제 경기 결과의 원인이라고 단정할 수는 없다.
     """)
 
     st.divider()
 
-    # 새로운 경기 예측
+    # -----------------------------------------------------
+    # 5단계: 새로운 경기 예측
+    # -----------------------------------------------------
+
     st.subheader("새로운 경기의 결과 예측")
 
     st.write("""
@@ -1065,14 +1127,18 @@ with tab4:
 
     st.divider()
 
-    # 최종 결론과 한계
+    # -----------------------------------------------------
+    # 6단계: 최종 결론과 한계
+    # -----------------------------------------------------
+
     st.subheader("최종 분석 및 한계")
 
     st.markdown("""
     **분석에서 확인할 점**
 
     - 전반전 상황별 최종 결과 비율을 비교한다.
-    - 세 가지 모델의 평가 지표를 비교해 로지스틱 회귀의 성능을 확인한다.
+    - 기준선과 One-vs-Rest 로지스틱 회귀의 평가 지표를 비교한다.
+    - 시그모이드 함수로 각 결과의 이진 확률을 계산하는 과정을 살펴본다.
     - 로지스틱 회귀의 예측 확률과 계수를 통해 모델의 판단을 살펴본다.
 
     **분석의 한계**
